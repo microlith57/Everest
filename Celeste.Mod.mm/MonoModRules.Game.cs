@@ -54,7 +54,14 @@ namespace MonoMod {
     /// Swaps BlendFunction.Min/Max for BlendState construction, as they are switched on XNA/FNA
     /// </summary>
     [MonoModCustomMethodAttribute(nameof(MonoModRules.PatchMinMaxBlendFunction))]
-    class PatchMinMaxBlendFunction : Attribute {}
+    class PatchMinMaxBlendFunction : Attribute { }
+
+    /// <summary>
+    /// Swaps Dictionary&lt;Type, V&rt; to use Celeste.Mod.TypeNameEqualityComparer, but only if a debugger is attached;
+    /// this is so the debugger can properly inspect these dictionaries
+    /// </summary>
+    [MonoModCustomMethodAttribute(nameof(MonoModRules.PatchTypeDictionaryComparer))]
+    class PatchTypeDictionaryComparerAttribute : Attribute { }
 #endregion
 
     static partial class MonoModRules {
@@ -356,7 +363,81 @@ namespace MonoMod {
                     c.Instrs[c.Index-2] = Instruction.Create(OpCodes.Ldc_I4, (int) BlendFunction.Min);
             }
         }
-        #endregion
+
+        public static void PatchTypeDictionaryComparer(ILContext il, CustomAttribute attrib) {
+            ILCursor c = new ILCursor(il);
+
+            TypeDefinition t_Debugger = MonoModRule.Modder.FindType("System.Diagnostics.Debugger").Resolve();
+            MethodReference m_IsAttached = MonoModRule.Modder.Module.ImportReference(t_Debugger.FindMethod("get_IsAttached"));
+
+            TypeDefinition t_TypeNameEqualityComparer = MonoModRule.Modder.FindType("Celeste.Mod.TypeNameEqualityComparer").Resolve();
+            MethodReference ctor_TypeNameEqualityComparer = t_TypeNameEqualityComparer.FindMethod(".ctor");
+
+            MethodReference m_Dictionary_ctor = null;
+
+            bool matched = false;
+
+            while (c.TryGotoNext(MoveType.Before, i =>
+                // looking for a constructor call...
+                i.MatchNewobj(out m_Dictionary_ctor) &&
+                // of a generic type...
+                m_Dictionary_ctor.DeclaringType is GenericInstanceType t_dict &&
+                // that is a Dictionary<K, V>...
+                t_dict.ElementType.FullName == "System.Collections.Generic.Dictionary`2" &&
+                // with Type as the key
+                t_dict.GenericArguments[0].FullName == "System.Type"
+            )) {
+
+                TypeDefinition t_Dictionary_Type_V = m_Dictionary_ctor.DeclaringType.Resolve();
+                Collection<ParameterDefinition> old_ctor_params = m_Dictionary_ctor.Parameters;
+
+                MethodDefinition m_new_ctor = t_Dictionary_Type_V.Methods.FirstOrDefault(ctor => {
+                    // find a constructor with the same parameters, but an extra one for the comparer
+                    if (!ctor.IsConstructor ||
+                        ctor.Parameters.Count != m_Dictionary_ctor.Parameters.Count + 1 ||
+                        ctor.Parameters[^1].Name != "comparer")
+                        return false;
+
+                    for (int i = 0; i < old_ctor_params.Count; i++) {
+                        if (old_ctor_params[i].ParameterType.FullName != ctor.Parameters[i].ParameterType.FullName)
+                            return false;
+                    }
+
+                    return true;
+                }) ?? throw new Exception("Failed to find suitable Dictionary constructor");
+                MethodReference m_imported_new_ctor = MonoModRule.Modder.Module.ImportReference(m_new_ctor);
+
+                // converting
+                //     newobj System.Void System.Collections.Generic.Dictionary`2<System.Type,V>::.ctor()
+                // to
+                // +   call System.Debugger::get_IsAttached()
+                // +   brfalse :else
+                // +   newobj System.Void Celeste.Mod.TypeNameEqualityComparer::.ctor()
+                // +   newobj System.Void System.Collections.Generic.Dictionary`2<System.Type,V>::.ctor(System.Collections.Generic.IEqualityComparer`1<TKey>))
+                // +   br :done
+                // + else:
+                //     newobj System.Void System.Collections.Generic.Dictionary`2<System.Type,V>::.ctor()
+                // + done:
+
+                ILLabel l_else = c.DefineLabel();
+                ILLabel l_end = c.DefineLabel();
+
+                c.Emit(OpCodes.Call, m_IsAttached);
+                c.Emit(OpCodes.Brfalse, l_else);
+                c.Emit(OpCodes.Newobj, ctor_TypeNameEqualityComparer);
+                c.Emit(OpCodes.Newobj, m_imported_new_ctor);
+                c.Emit(OpCodes.Br, l_end);
+                c.MarkLabel(l_else);
+                c.Index++;
+                c.MarkLabel(l_end);
+
+                matched = true;
+
+            }
+
+            if (!matched) throw new Exception("expected to match a Dictionary<Type, V> constructor, but didn't");
+        }
+#endregion
 
     }
 }

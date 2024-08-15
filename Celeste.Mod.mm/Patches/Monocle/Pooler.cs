@@ -9,5 +9,10 @@ namespace Monocle {
             [MonoModIgnore]
             get;
         }
+
+        [MonoModIgnore]
+        [MonoModConstructor]
+        [PatchTypeDictionaryComparer]
+        public extern void ctor();
     }
 }

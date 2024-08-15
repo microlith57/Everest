@@ -34,6 +34,12 @@ namespace Monocle {
     }
 
     class patch_Tracker : Tracker {
+
+        [MonoModIgnore]
+        [MonoModConstructor]
+        [PatchTypeDictionaryComparer]
+        public extern void ctor();
+
         // A temporary cache to store the results of FakeAssembly.GetFakeEntryAssemblies
         // Set to null outside of Initialize.
         private static Type[] _temporaryAllTypes;
