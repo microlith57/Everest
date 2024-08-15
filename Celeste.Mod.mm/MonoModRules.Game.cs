@@ -367,6 +367,13 @@ namespace MonoMod {
         public static void PatchTypeDictionaryComparer(ILContext il, CustomAttribute attrib) {
             ILCursor c = new ILCursor(il);
 
+            TypeReference t_Void = MonoModRule.Modder.Module.ImportReference(MonoModRule.Modder.FindType("System.Void"));
+            TypeReference t_Type = MonoModRule.Modder.Module.ImportReference(MonoModRule.Modder.FindType("System.Type"));
+
+            TypeReference t_EqualityComparer = MonoModRule.Modder.Module.ImportReference(MonoModRule.Modder.FindType("System.Collections.Generic.IEqualityComparer`1"));
+            GenericInstanceType t_EqualityComparer_Type = new GenericInstanceType(t_EqualityComparer);
+            t_EqualityComparer_Type.GenericArguments.Add(t_Type);
+
             TypeDefinition t_Debugger = MonoModRule.Modder.FindType("System.Diagnostics.Debugger").Resolve();
             MethodReference m_IsAttached = MonoModRule.Modder.Module.ImportReference(t_Debugger.FindMethod("get_IsAttached"));
 
@@ -388,23 +395,15 @@ namespace MonoMod {
                 t_dict.GenericArguments[0].FullName == "System.Type"
             )) {
 
-                TypeDefinition t_Dictionary_Type_V = m_Dictionary_ctor.DeclaringType.Resolve();
-                Collection<ParameterDefinition> old_ctor_params = m_Dictionary_ctor.Parameters;
+                GenericInstanceType t_Dictionary_Type_V = (GenericInstanceType) m_Dictionary_ctor.DeclaringType;
 
-                MethodDefinition m_new_ctor = t_Dictionary_Type_V.Methods.FirstOrDefault(ctor => {
-                    // find a constructor with the same parameters, but an extra one for the comparer
-                    if (!ctor.IsConstructor ||
-                        ctor.Parameters.Count != m_Dictionary_ctor.Parameters.Count + 1 ||
-                        ctor.Parameters[^1].Name != "comparer")
-                        return false;
+                MethodReference m_new_ctor = new MethodReference(".ctor", t_Void, m_Dictionary_ctor.DeclaringType) {
+                    HasThis = true
+                };
+                foreach (ParameterDefinition param in m_Dictionary_ctor.Parameters)
+                    m_new_ctor.Parameters.Add(param);
+                // m_new_ctor.Parameters.Add(new ParameterDefinition(t_EqualityComparer_Type) { Name = "comparer" });
 
-                    for (int i = 0; i < old_ctor_params.Count; i++) {
-                        if (old_ctor_params[i].ParameterType.FullName != ctor.Parameters[i].ParameterType.FullName)
-                            return false;
-                    }
-
-                    return true;
-                }) ?? throw new Exception("Failed to find suitable Dictionary constructor");
                 MethodReference m_imported_new_ctor = MonoModRule.Modder.Module.ImportReference(m_new_ctor);
 
                 // converting
@@ -424,7 +423,7 @@ namespace MonoMod {
 
                 c.Emit(OpCodes.Call, m_IsAttached);
                 c.Emit(OpCodes.Brfalse, l_else);
-                c.Emit(OpCodes.Newobj, ctor_TypeNameEqualityComparer);
+                // c.Emit(OpCodes.Newobj, ctor_TypeNameEqualityComparer);
                 c.Emit(OpCodes.Newobj, m_imported_new_ctor);
                 c.Emit(OpCodes.Br, l_end);
                 c.MarkLabel(l_else);
@@ -435,7 +434,8 @@ namespace MonoMod {
 
             }
 
-            if (!matched) throw new Exception("expected to match a Dictionary<Type, V> constructor, but didn't");
+            if (!matched)
+                throw new Exception("expected to match a Dictionary<Type, V> constructor, but didn't");
         }
 #endregion
 

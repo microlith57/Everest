@@ -7,13 +7,13 @@ namespace Celeste.Mod
     /// <summary>
     /// Used by the PatchTypeDictionaryComparer rule to allow debuggers to inspect dictionaries with types as keys.
     /// </summary>
-    public class TypeNameEqualityComparer : IEqualityComparer<Type>
+    public class TypeNameEqualityComparer : EqualityComparer<Type>
     {
-        public bool Equals(Type x, Type y)
+        public override bool Equals(Type x, Type y)
         {
             return (x == y) || x.FullName.Equals(y.FullName, StringComparison.Ordinal);
         }
 
-        public int GetHashCode(Type type) => type.FullName.GetHashCode();
+        public override int GetHashCode(Type type) => type.FullName.GetHashCode();
     }
 }
