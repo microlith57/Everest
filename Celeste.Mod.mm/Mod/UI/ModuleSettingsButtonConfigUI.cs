@@ -1,8 +1,8 @@
 ﻿using Microsoft.Xna.Framework.Input;
 using Monocle;
 using MonoMod;
-using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 
 namespace Celeste.Mod {
@@ -20,6 +20,17 @@ namespace Celeste.Mod {
             All.Add(Buttons.LeftStick);
 
             Module = module;
+            if (Engine.Scene is Level level) {
+                bool? oldAllowHudHide = null;
+                OnUpdate = () => {
+                    if (oldAllowHudHide == null) {
+                        oldAllowHudHide = level.AllowHudHide;
+                        level.AllowHudHide = false;
+                        // Mods may will reset the initial value of OnClose after ctor and cause this to not work. so lets the later OnUpdate add this for OnClose.
+                        OnClose += () => level.AllowHudHide = oldAllowHudHide.Value;
+                    }
+                };
+            }
             // Base already reloads too early before the module has been set.
             Reload(2);
         }
@@ -67,11 +78,11 @@ namespace Celeste.Mod {
                     DefaultButtonBindingAttribute defaults = prop.GetCustomAttribute<DefaultButtonBindingAttribute>();
 
                     Bindings.Add(new ButtonBindingEntry(binding, defaults));
-                    
+
                     string subheader = prop.GetCustomAttribute<SettingSubHeaderAttribute>()?.SubHeader;
                     if (subheader != null)
                         Add(new SubHeader(subheader.DialogCleanOrNull() ?? subheader));
-                    
+
                     AddMapForceLabel(name, binding.Binding);
                 }
             }
@@ -89,9 +100,14 @@ namespace Celeste.Mod {
 
         public override void Reset() {
             foreach (ButtonBindingEntry entry in Bindings) {
-                entry.Binding.Binding.Controller.Clear();
-                if (entry.Defaults != null && entry.Defaults.Button != 0)
-                    entry.Binding.Binding.Controller.Add(entry.Defaults.Button);
+                Binding binding = entry.Binding.Binding;
+                binding.Controller.Clear();
+                if (entry.Defaults is { } defaults) {
+                    if (defaults.Button != 0)
+                        binding.Controller.Add(defaults.Button);
+                    if (defaults.Buttons != null)
+                        binding.Add(defaults.Buttons.Where(b => b != 0).ToArray());
+                }
             }
             Input.Initialize();
             Reload(Selection);

@@ -48,7 +48,7 @@ namespace Celeste {
                 break;
             }
 
-            if (CoreModule.Settings.LaunchWithoutIntro && introRoutine != null) {
+            if ((CoreModule.Settings.LaunchWithoutIntro || Everest.Flags.IsHeadless) && introRoutine != null) {
                 skipped = true;
             }
         }
@@ -85,8 +85,10 @@ namespace Celeste {
             Stopwatch timer = Stopwatch.StartNew();
 
             Audio.Init();
-            // Original code loads audio banks here.
-            Settings.Instance.ApplyVolumes();
+            if (!Everest.Flags.IsHeadless) {
+                // Original code loads audio banks here.
+                Settings.Instance.ApplyVolumes();
+            }
             audioLoaded = true;
             Console.WriteLine(" - AUDIO LOAD: " + timer.ElapsedMilliseconds + "ms");
             timer.Stop();
@@ -114,7 +116,7 @@ namespace Celeste {
             timer = Stopwatch.StartNew();
             MainThreadHelper.Boost = 50;
             patch_VirtualTexture.WaitFinishFastTextureLoading();
-            MainThreadHelper.Get(() => MainThreadHelper.Boost = 0).GetResult();
+            MainThreadHelper.Schedule(() => MainThreadHelper.Boost = 0).AsTask().Wait();
             // FIXME: There could be ongoing tasks which add to the main thread queue right here.
             Console.WriteLine(" - FASTTEXTURELOADING LOAD: " + timer.ElapsedMilliseconds + "ms");
             timer.Stop();
@@ -134,7 +136,7 @@ namespace Celeste {
 
             bool transitionToModUpdater = false;
 
-            if (CoreModule.Settings.AutoUpdateModsOnStartup) {
+            if (CoreModule.Settings.AutoUpdateModsOnStartup && !Everest.Flags.IsHeadless) {
                 if (!ModUpdaterHelper.IsAsyncUpdateCheckingDone()) {
                     // update checking is not done yet.
                     // transition to mod updater screen to display the "checking for updates" message.
@@ -171,7 +173,7 @@ namespace Celeste {
             if (previousVersion < new Version(1, 2109, 0)) {
                 // user just upgraded: create mod save data backups.
                 // (this is very similar to OverworldLoader.CheckVariantsPostcardAtLaunch)
-                Logger.Log(LogLevel.Verbose, "core", $"User just upgraded from version {previousVersion}: creating mod save data backups.");
+                Logger.Verbose("core", $"User just upgraded from version {previousVersion}: creating mod save data backups.");
 
                 for (int i = 0; i < 3; i++) { // only the first 3 saves really matter.
                     if (!UserIO.Exists(SaveData.GetFilename(i))) {
@@ -205,6 +207,8 @@ namespace MonoMod {
             // The routine is stored in a compiler-generated method.
             method = method.GetEnumeratorMoveNext();
 
+            bool found = false;
+
             Mono.Collections.Generic.Collection<Instruction> instrs = method.Body.Instructions;
             for (int instri = 0; instri < instrs.Count; instri++) {
                 Instruction instr = instrs[instri];
@@ -212,7 +216,12 @@ namespace MonoMod {
                 if (instr.OpCode == OpCodes.Newobj && (instr.Operand as MethodReference)?.GetID() == "System.Void Celeste.OverworldLoader::.ctor(Celeste.Overworld/StartMode,Celeste.HiresSnow)") {
                     instr.OpCode = OpCodes.Call;
                     instr.Operand = m_GetNextScene;
+                    found = true;
                 }
+            }
+
+            if (!found) {
+                throw new Exception("Call to OverworldLoader::.ctor not found in " + method.FullName + "!");
             }
         }
 

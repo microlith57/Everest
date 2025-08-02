@@ -5,8 +5,10 @@ using Celeste.Mod;
 using Celeste.Mod.Core;
 using FMOD;
 using FMOD.Studio;
+using Microsoft.Xna.Framework;
 using Monocle;
 using MonoMod;
+using SDL2;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -18,6 +20,7 @@ namespace Celeste {
 
         private static FMOD.Studio.System system;
         private static bool ready;
+        private static FMOD.Studio._3D_ATTRIBUTES attributes3d;
         public static FMOD.Studio.System System => system;
 
         public static Dictionary<Guid, string> cachedPaths = new Dictionary<Guid, string>();
@@ -33,15 +36,48 @@ namespace Celeste {
         private static HashSet<string> ingestedModBankPaths = new HashSet<string>();
         public static bool AudioInitialized { get; private set; } = false;
 
-        [MonoModIgnore]
-        internal static extern void CheckFmod(RESULT result);
+        [MonoModReplace]
+        internal static void CheckFmod(RESULT result) {
+            if (result != RESULT.OK)
+                throw new Exception($"FMOD Failed: {result} ({Error.String(result)})");
+        }
 
-        public static extern void orig_Init();
+        [MonoModIfFlag("RelinkXNA")]
+        [DllImport("fmod_SDL", CallingConvention = CallingConvention.Cdecl)]
+        private static extern void FMOD_SDL_Register(IntPtr system);
+
+        [MonoModReplace]
         public static void Init() {
+            if (Everest.Flags.IsHeadless) {
+                // Stub out audio system
+                system = new FMOD.Studio.System(IntPtr.Zero);
+                return;
+            }
+
             bool fmodLiveUpdate = Settings.Instance.LaunchWithFMODLiveUpdate;
             Settings.Instance.LaunchWithFMODLiveUpdate |= CoreModule.Settings.LaunchWithFMODLiveUpdateInEverest;
+        
+            // Original initialization code
+            {
+                FMOD.Studio.INITFLAGS flags = FMOD.Studio.INITFLAGS.NORMAL;
+                if (Settings.Instance.LaunchWithFMODLiveUpdate)
+                    flags = FMOD.Studio.INITFLAGS.LIVEUPDATE;
 
-            orig_Init();
+                CheckFmod(FMOD.Studio.System.create(out system));
+
+                // The following snippet is missing on XNA
+                system.getLowLevelSystem(out var lowLevelSystem);
+                if (SDL.SDL_GetPlatform().Equals("Linux"))
+                    FMOD_SDL_Register(lowLevelSystem.getRaw());
+
+                CheckFmod(system.initialize(1024, flags, FMOD.INITFLAGS.NORMAL, IntPtr.Zero));
+
+                attributes3d.forward = new VECTOR { x = 0f, y = 0f, z = 1f };
+                attributes3d.up = new VECTOR { x = 0f, y = 1f, z = 0f };
+                Audio.SetListenerPosition(new Vector3(0f, 0f, 1f), new Vector3(0f, 1f, 0f), new Vector3(0f, 0f, -345f));
+
+                ready = true;
+            }
 
             Settings.Instance.LaunchWithFMODLiveUpdate = fmodLiveUpdate;
 
@@ -81,6 +117,10 @@ namespace Celeste {
         }
 
         public static void IngestNewBanks() {
+            if (Everest.Flags.IsHeadless) {
+                return;
+            }
+
             lock (Everest.Content.Map) {
                 foreach (ModAsset asset in Everest.Content.Map.Values.Where(asset => asset.Type == typeof(AssetTypeBank))) {
                     if (!ingestedModBankPaths.Contains(asset.PathVirtual)) {
@@ -92,6 +132,10 @@ namespace Celeste {
 
         [MonoModReplace]
         public static void Unload() {
+            if (Everest.Flags.IsHeadless) {
+                return;
+            }
+
             if (system == null)
                 return;
 
@@ -107,7 +151,11 @@ namespace Celeste {
         /// Loads an FMOD Bank from the given asset.
         /// </summary>
         public static Bank IngestBank(ModAsset asset) {
-            Logger.Log(LogLevel.Verbose, "Audio.IngestBank", asset.PathVirtual);
+            if (Everest.Flags.IsHeadless) {
+                return new Bank(IntPtr.Zero);
+            }
+
+            Logger.Verbose("Audio.IngestBank", asset.PathVirtual);
             ingestedModBankPaths.Add(asset.PathVirtual);
 
             Bank bank;
@@ -137,7 +185,7 @@ namespace Celeste {
             }
 
             if (loadResult == RESULT.ERR_EVENT_ALREADY_LOADED) {
-                Logger.Log(LogLevel.Warn, "Audio.IngestBank", $"Cannot load {asset.PathVirtual} due to conflicting events!");
+                Logger.Warn("Audio.IngestBank", $"Cannot load {asset.PathVirtual} due to conflicting events!");
                 return null;
             }
 
@@ -150,7 +198,7 @@ namespace Celeste {
             patch_Banks.ModCache[asset] = bank;
 
             bank.getID(out Guid id);
-            cachedBankPaths[id] = $"bank:/mods/{asset.PathVirtual.Substring("Audio/".Length)}";
+            cachedBankPaths[id] = $"bank:/mods/{asset.PathVirtual["Audio/".Length..]}";
             return bank;
         }
 
@@ -158,26 +206,28 @@ namespace Celeste {
         /// Loads an FMOD GUID table from the given asset.
         /// </summary>
         public static void IngestGUIDs(ModAsset asset) {
-            Logger.Log(LogLevel.Verbose, "Audio.IngestGUIDs", asset.PathVirtual);
+            if (Everest.Flags.IsHeadless) {
+                return;
+            }
+
+            Logger.Verbose("Audio.IngestGUIDs", asset.PathVirtual);
             using (Stream stream = asset.Stream)
             using (StreamReader reader = new StreamReader(asset.Stream)) {
-                string line;
                 while (reader.Peek() != -1) {
-                    line = reader.ReadLine().Trim('\r', '\n').Trim();
+                    var line = reader.ReadLine().AsSpan().Trim("\r\n").Trim();
 
                     int indexOfSpace = line.IndexOf(' ');
                     if (indexOfSpace == -1)
                         continue;
 
-                    if (!Guid.TryParse(line.Substring(0, indexOfSpace), out Guid id) ||
-                        cachedPaths.ContainsKey(id))
+                    if (!Guid.TryParse(line[..indexOfSpace], out Guid id) || cachedPaths.ContainsKey(id))
                         continue;
 
                     // only ingest the GUID if the corresponding event exists.
                     if (system.getEventByID(id, out EventDescription _event) > RESULT.OK)
                         continue;
 
-                    string path = line.Substring(indexOfSpace + 1);
+                    string path = line[(indexOfSpace + 1)..].ToString();
                     if (!usedGuids.TryGetValue(path, out HashSet<Guid> used))
                         usedGuids[path] = used = new HashSet<Guid>();
                     if (!used.Add(id))
@@ -194,7 +244,7 @@ namespace Celeste {
 
         public static extern void orig_ReleaseUnusedDescriptions();
         public static void ReleaseUnusedDescriptions() {
-            if (!CoreModule.Settings.UnloadUnusedAudio)
+            if (Everest.Flags.IsHeadless || !CoreModule.Settings.UnloadUnusedAudio)
                 return;
             orig_ReleaseUnusedDescriptions();
         }
@@ -202,7 +252,7 @@ namespace Celeste {
 
         [MonoModReplace]
         public static string GetEventName(EventInstance instance) {
-            if (instance == null)
+            if (Everest.Flags.IsHeadless || instance == null)
                 return "";
 
             instance.getDescription(out EventDescription desc);
@@ -213,7 +263,7 @@ namespace Celeste {
         }
 
         public static string GetEventName(EventDescription desc) {
-            if (desc == null)
+            if (Everest.Flags.IsHeadless || desc == null)
                 return "";
 
             desc.getID(out Guid id);
@@ -228,7 +278,7 @@ namespace Celeste {
         }
 
         public static string GetBankName(Bank bank) {
-            if (bank == null)
+            if (Everest.Flags.IsHeadless || bank == null)
                 return "";
 
             bank.getID(out Guid id);
@@ -242,6 +292,10 @@ namespace Celeste {
 
         [MonoModReplace]
         public static EventDescription GetEventDescription(string path) {
+            if (Everest.Flags.IsHeadless) {
+                return new EventDescription(IntPtr.Zero);
+            }
+
             EventDescription desc = null;
             if (path == null || Audio.cachedEventDescriptions.TryGetValue(path, out desc))
                 return desc;
@@ -252,7 +306,7 @@ namespace Celeste {
                 status = RESULT.OK;
 
             } else if (path.StartsWith("guid://")) {
-                status = system.getEventByID(new Guid(path.Substring(7)), out desc);
+                status = system.getEventByID(Guid.Parse(path.AsSpan(7)), out desc);
 
             } else {
                 status = system.getEvent(path, out desc);
@@ -264,7 +318,7 @@ namespace Celeste {
 
             } else if (status == RESULT.ERR_EVENT_NOTFOUND) {
                 if (path is not ("null" or "event:/none")) {
-                    Logger.Log(LogLevel.Warn, "Audio", $"Event not found: {path}");
+                    Logger.Warn("Audio", $"Event not found: {path}");
                 }
 
             } else {
@@ -283,6 +337,10 @@ namespace Celeste {
 
             [MonoModReplace]
             public static Bank Load(string name, bool loadStrings) {
+                if (Everest.Flags.IsHeadless) {
+                    return new Bank(IntPtr.Zero);
+                }
+
                 if (Banks == null)
                     Banks = new Dictionary<string, Bank>();
 
@@ -354,9 +412,6 @@ namespace Celeste {
 
     }
     public static class AudioExt {
-
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
 
         public static Dictionary<string, Bank> Banks => patch_Audio.patch_Banks.Banks;
 

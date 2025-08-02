@@ -40,7 +40,7 @@ namespace Celeste {
             }
 
             if (!_LoadStrings.Contains(eventID)) {
-                Logger.Log(LogLevel.Warn, "EventTrigger", $"Event '{eventID}' does not exist!");
+                Logger.Warn("EventTrigger", $"Event '{eventID}' does not exist!");
                 return true; //To a avoid hard crash on missing event
             }
 
@@ -80,6 +80,9 @@ namespace MonoMod {
             MethodReference m_LoadStrings_ctor = MonoModRule.Modder.Module.ImportReference(td_LoadStrings.FindMethod("System.Void .ctor()"));
             m_LoadStrings_ctor.DeclaringType = f_LoadStrings.FieldType;
             cctor_il.Emit(OpCodes.Newobj, m_LoadStrings_ctor);
+
+            bool eventHandlerInjectionPointFound = false;
+            bool loadStringFound = false;
 
             Mono.Collections.Generic.Collection<Instruction> instrs = method.Body.Instructions;
             ILProcessor il = method.Body.GetILProcessor();
@@ -125,6 +128,8 @@ namespace MonoMod {
                     // Otherwise, pop the event and return to skip any original event handler.
                     instrs.Insert(instri++, il.Create(OpCodes.Pop));
                     instrs.Insert(instri++, il.Create(OpCodes.Ret));
+
+                    eventHandlerInjectionPointFound = true;
                 }
 
                 if (instr.OpCode == OpCodes.Ldstr) {
@@ -132,7 +137,16 @@ namespace MonoMod {
                     cctor_il.Emit(OpCodes.Ldstr, instr.Operand);
                     cctor_il.Emit(OpCodes.Callvirt, m_LoadStrings_Add);
                     cctor_il.Emit(OpCodes.Pop); // HashSet.Add returns a bool.
+
+                    loadStringFound = true;
                 }
+            }
+
+            if (!eventHandlerInjectionPointFound) {
+                throw new Exception("Event handler injection point not found in " + method.FullName + "!");
+            }
+            if (!loadStringFound) {
+                throw new Exception("ldstr not found in " + method.FullName + "!");
             }
 
             cctor_il.Emit(OpCodes.Stsfld, f_LoadStrings);

@@ -5,7 +5,9 @@ using Celeste.Mod.Helpers;
 using MonoMod;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
+using System.Runtime.InteropServices;
 
 namespace Monocle {
     /// <summary>
@@ -34,67 +36,223 @@ namespace Monocle {
     }
 
     class patch_Tracker : Tracker {
-        [MonoModIgnore]
-        public static extern List<Type> GetSubclasses(Type type);
+        // A temporary cache to store the results of FakeAssembly.GetFakeEntryAssemblies
+        // Set to null outside of Initialize.
+        private static Type[] _temporaryAllTypes;
+
+        private static Type[] GetAllTypesUncached() => FakeAssembly.GetFakeEntryAssembly().GetTypesSafe();
+
+        private static int TrackedTypeVersion;
+
+        private int currentVersion;
+
+        public extern void orig_ctor();
+
+        [MonoModConstructor]
+        public void ctor() {
+            orig_ctor();
+            currentVersion = TrackedTypeVersion;
+        }
+
+        [MonoModReplace]
+        private static List<Type> GetSubclasses(Type type) {
+            bool shouldNullOutCache = _temporaryAllTypes is null;
+            _temporaryAllTypes ??= GetAllTypesUncached();
+
+            List<Type> subclasses = new();
+            foreach (Type otherType in _temporaryAllTypes) {
+                if (type != otherType && type.IsAssignableFrom(otherType))
+                    subclasses.Add(otherType);
+            }
+
+            // This method got called outside of Initialize, so we can't rely on it clearing out the cache.
+            // Let's do that now instead.
+            if (shouldNullOutCache)
+                _temporaryAllTypes = null;
+
+            return subclasses;
+        }
 
         public static extern void orig_Initialize();
         public new static void Initialize() {
+            _temporaryAllTypes = GetAllTypesUncached();
+
             orig_Initialize();
 
             // search for entities with [TrackedAs]
-            Type[] types = FakeAssembly.GetFakeEntryAssembly().GetTypesSafe();
-            foreach (Type type in types) {
-                object[] customAttributes = type.GetCustomAttributes(typeof(TrackedAsAttribute), inherit: false);
-                foreach (object customAttribute in customAttributes) {
-                    TrackedAsAttribute trackedAs = customAttribute as TrackedAsAttribute;
-                    Type trackedAsType = trackedAs.TrackedAsType;
-                    bool inherited = trackedAs.Inherited;
-                    if (typeof(Entity).IsAssignableFrom(type)) {
-                        if (!type.IsAbstract) {
-                            // this is an entity. copy the registered types for the target entity
-                            if (!TrackedEntityTypes.ContainsKey(type)) {
-                                TrackedEntityTypes.Add(type, new List<Type>());
-                            }
-                            TrackedEntityTypes[type].AddRange(TrackedEntityTypes.TryGetValue(trackedAsType, out List<Type> list) ? list : new List<Type>());
-                            TrackedEntityTypes[type] = TrackedEntityTypes[type].Distinct().ToList();
-                        }
-                        if (inherited) {
-                            // do the same for subclasses
-                            foreach (Type subclass in GetSubclasses(type)) {
-                                if (!subclass.IsAbstract) {
-                                    if (!TrackedEntityTypes.ContainsKey(subclass))
-                                        TrackedEntityTypes.Add(subclass, new List<Type>());
-                                    TrackedEntityTypes[subclass].AddRange(TrackedEntityTypes.TryGetValue(trackedAsType, out List<Type> list) ? list : new List<Type>());
-                                    TrackedEntityTypes[subclass] = TrackedEntityTypes[subclass].Distinct().ToList();
-                                }
-                            }
-                        }
-                    } else if (typeof(Component).IsAssignableFrom(type)) {
-                        if (!type.IsAbstract) {
-                            // this is an component. copy the registered types for the target component
-                            if (!TrackedComponentTypes.ContainsKey(type)) {
-                                TrackedComponentTypes.Add(type, new List<Type>());
-                            }
-                            TrackedComponentTypes[type].AddRange(TrackedComponentTypes.TryGetValue(trackedAsType, out List<Type> list) ? list : new List<Type>());
-                            TrackedComponentTypes[type] = TrackedComponentTypes[type].Distinct().ToList();
-                        }
-                        if (inherited) {
-                            // do the same for subclasses
-                            foreach (Type subclass in GetSubclasses(type)) {
-                                if (!subclass.IsAbstract) {
-                                    if (!TrackedComponentTypes.ContainsKey(subclass))
-                                        TrackedComponentTypes.Add(subclass, new List<Type>());
-                                    TrackedComponentTypes[subclass].AddRange(TrackedComponentTypes.TryGetValue(trackedAsType, out List<Type> list) ? list : new List<Type>());
-                                    TrackedComponentTypes[subclass] = TrackedComponentTypes[subclass].Distinct().ToList();
-                                }
-                            }
-                        }
-                    } else {
-                        // this is neither an entity nor a component. Help!
-                        throw new Exception("Type '" + type.Name + "' cannot be TrackedAs because it does not derive from Entity or Component");
-                    }
+            int oldVersion = TrackedTypeVersion;
+            foreach (Type type in _temporaryAllTypes) {
+                foreach (TrackedAsAttribute trackedAs in type.GetCustomAttributes(typeof(TrackedAsAttribute), inherit: false).Cast<TrackedAsAttribute>()) {
+                    AddTypeToTracker(type, trackedAs.TrackedAsType, trackedAs.Inherited);
                 }
             }
+            TrackedTypeVersion = oldVersion;
+            // don't hold references to all the types anymore
+            _temporaryAllTypes = null;
+        }
+
+        /// <summary>
+        /// Dynamically add a new type to the active scene's tracker. The <paramref name="type"/> can also be TrackedAs if <paramref name="trackedAs"/> is provided.
+        /// If <paramref name="inheritAll"/> is true, all subtypes of <paramref name="type"/> will be tracked under it.
+        /// Call <seealso cref="AddSpecificType(Type, Type, Dictionary{Type, List{Type}})"/> to add the scene's entities to the tracker after adding the type.
+        /// </summary>
+        /// <param name="type">The type to add to the Tracker</param>
+        /// <param name="trackedAs">If the type should be TrackedAs</param>
+        /// <param name="inheritAll">If all subtypes of <paramref name="type"/> should also be tracked under it</param>
+        public static void AddTypeToTracker(Type type, Type trackedAs = null, bool inheritAll = false) {
+            AddTypeToTracker(type, trackedAs, inheritAll ? GetSubclasses(type).ToArray() : Array.Empty<Type>());
+        }
+
+        /// <summary>
+        /// Dynamically add a new type to the active scene's tracker. The <paramref name="type"/> can also be TrackedAs if <paramref name="trackedAs"/> is provided.
+        /// Any <paramref name="subtypes"/> passed will also be tracked under <paramref name="type"/>.
+        /// Call <seealso cref="AddSpecificType(Type, Type, Dictionary{Type, List{Type}})"/> to add the scene's entities to the tracker after adding the type.
+        /// </summary>
+        /// <param name="type">The type to add to the Tracker</param>
+        /// <param name="trackedAs">If the type should be TrackedAs</param>
+        /// <param name="subtypes">Any subtypes that should be tracked under <paramref name="type"/></param>
+        public static void AddTypeToTracker(Type type, Type trackedAs = null, params Type[] subtypes) {
+            Type trackedAsType = trackedAs != null && trackedAs.IsAssignableFrom(type) ? trackedAs : type;
+            bool? canTrack = typeof(Entity).IsAssignableFrom(type) ? true : typeof(Component).IsAssignableFrom(type) ? false : null;
+            if (canTrack is not bool trackedEntity) {
+                // this is neither an entity nor a component. Help!
+                throw new Exception("Type '" + type.Name + "' cannot be Tracked" + (trackedAsType != type ? "As" : "") + " because it does not derive from Entity or Component");
+            }
+            bool updated = false;
+            // copy the registered types for the target type
+            var knownTypes = trackedEntity ? StoredEntityTypes : StoredComponentTypes;
+            Dictionary<Type, List<Type>> tracked = trackedEntity ? TrackedEntityTypes : TrackedComponentTypes;
+            if (AddSpecificType(type, trackedAsType, tracked, knownTypes)) {
+                updated = true;
+            }
+            // do the same for subclasses
+            foreach (Type subtype in subtypes) {
+                if (trackedAsType.IsAssignableFrom(subtype) && AddSpecificType(subtype, trackedAsType, tracked, knownTypes)) {
+                    updated = true;
+                }
+            }
+            if (updated) {
+                TrackedTypeVersion++;
+            }
+        }
+
+        private static bool AddSpecificType(Type type, Type trackedAsType, Dictionary<Type, List<Type>> tracked, HashSet<Type> knownTypes) {
+            if (type.IsAbstract) {
+                return false;
+            }
+
+            // Make sure the tracker knows about both the type and trackedAs type, to fix scenarios like `[TrackedAs(typeof(UntrackedType))]`
+            knownTypes.Add(type);
+            knownTypes.Add(trackedAsType);
+            
+            if (!tracked.TryGetValue(type, out List<Type> value)) {
+                value = new List<Type>();
+                tracked.Add(type, value);
+            }
+            int cnt = value.Count;
+            value.Add(trackedAsType);
+            value.AddRange(tracked.TryGetValue(trackedAsType, out List<Type> list) ? list : new List<Type>());
+            List<Type> result = tracked[type] = value.Distinct().ToList();
+            return cnt != result.Count;
+        }
+
+        [MonoModIgnore]
+        internal extern void EntityAdded(Entity entity);
+
+        [MonoModIgnore]
+        internal extern void ComponentAdded(Component component);
+        
+        /// <summary>
+        /// Ensures the <paramref name="scene"/>'s tracker contains all entities of all tracked Types from the <paramref name="scene"/>.
+        /// Must be called if a type is added to the tracker manually and if the <paramref name="scene"/>'s Tracker isn't refreshed.
+        /// If called back to back without a type added to the Tracker, it won't go through again, for performance.
+        /// <paramref name="force"/> will make ensure the Refresh happens, even if run back to back.
+        /// Only the <paramref name="scene"/>'s Tracker's refreshed state is changed.
+        /// If <paramref name="scene"/> is null, it will default to Engine.Scene.
+        /// </summary>
+        public static void Refresh(Scene scene = null, bool force = false) {
+            Scene sceneUpdate = scene ?? Engine.Scene;
+
+            var tracker = (sceneUpdate.Tracker as patch_Tracker)!;
+            if (tracker.currentVersion >= TrackedTypeVersion && !force) {
+                return;
+            }
+            tracker.currentVersion = TrackedTypeVersion;
+            foreach (Type entityType in StoredEntityTypes) {
+                ref var list = ref CollectionsMarshal.GetValueRefOrAddDefault(tracker.Entities, entityType, out _);
+                list ??= new();
+                list.Clear();
+            }
+            foreach (Type componentType in StoredComponentTypes) {
+                ref var list = ref CollectionsMarshal.GetValueRefOrAddDefault(tracker.Components, componentType, out _);
+                list ??= new();
+                list.Clear();
+            }
+            
+            foreach (Entity entity in sceneUpdate.Entities) {
+                foreach (Component component in entity.Components) {
+                    tracker.ComponentAdded(component);
+                }
+                tracker.EntityAdded(entity);
+            }
+        }
+
+        /// <summary>
+        /// Gets all entities of the given type, adding that type to the tracker if needed.
+        /// </summary>
+        public List<Entity> GetEntitiesTrackIfNeeded<T>() where T : Entity
+            => GetEntitiesTrackIfNeeded(typeof(T));
+        
+        /// <summary>
+        /// Gets all components of the given type, adding that type to the tracker if needed.
+        /// </summary>
+        public List<Component> GetComponentsTrackIfNeeded<T>() where T : Component
+            => GetComponentsTrackIfNeeded(typeof(T));
+        
+        /// <summary>
+        /// Gets all entities of the given type, adding that type to the tracker if needed.
+        /// Will throw an exception when the type does not derive from Entity.
+        /// </summary>
+        public List<Entity> GetEntitiesTrackIfNeeded(Type type) {
+            if (Entities.TryGetValue(type, out var tracked))
+                return tracked;
+
+            // We only validate the type on the cold path
+            // - if the type does not derive from Entity, it couldn't have been added to Entities in the first place.
+            if (!typeof(Entity).IsAssignableFrom(type))
+                throw new Exception($"Type '{type}' does not derive from Entity.");
+
+            AddTypeToTracker(type);
+            Refresh();
+            
+            if (Entities.TryGetValue(type, out tracked))
+                return tracked;
+
+            // Should never happen
+            throw new UnreachableException($"Tracking type '{type}' failed for an unknown reason!");
+        }
+        
+        /// <summary>
+        /// Gets all components of the given type, adding that type to the tracker if needed.
+        /// Will throw an exception when the type does not derive from Component.
+        /// </summary>
+        public List<Component> GetComponentsTrackIfNeeded(Type type) {
+            if (Components.TryGetValue(type, out var tracked))
+                return tracked;
+
+            // We only validate the type on the cold path
+            // - if the type does not derive from Component, it couldn't have been added to Components in the first place.
+            if (!typeof(Component).IsAssignableFrom(type))
+                throw new Exception($"Type '{type}' does not derive from Component.");
+
+            AddTypeToTracker(type);
+            Refresh();
+            
+            if (Components.TryGetValue(type, out tracked))
+                return tracked;
+
+            // Should never happen
+            throw new UnreachableException($"Tracking type '{type}' failed for an unknown reason!");
         }
     }
 }

@@ -25,7 +25,7 @@ namespace Celeste {
 
         private bool started;
         private Session session;
-        public bool Loaded { get; private set; }
+        public bool Loaded { [MonoModIgnore] get; [MonoModIgnore] private set; }
 
         private static WeakReference<Thread> LastLoadingThread;
 
@@ -38,16 +38,21 @@ namespace Celeste {
         public extern void orig_ctor(Session session, Vector2? startPosition = default);
         [MonoModConstructor]
         public void ctor(Session session, Vector2? startPosition = default) {
-            Logger.Log(LogLevel.Info, "LevelLoader", $"Loading {session?.Area.GetSID() ?? "NULL"}");
+            string sid = session?.Area.GetSID() ?? "NULL";
+            string mapName = session?.Area != null && Dialog.Has(mapName = AreaData.Get(session.Area).Name) ? $" [{Dialog.Clean(mapName, Dialog.Languages["english"])}]" : null;
+            if (session?.Area.Mode > 0)
+                mapName = mapName + $" [{session.Area.Mode}]";
+
+            Logger.Info("LevelLoader", $"Loading {sid}{mapName}");
 
             if (LastLoadingThread != null &&
                 LastLoadingThread.TryGetTarget(out Thread lastThread) &&
                 (lastThread?.IsAlive ?? false)) {
-                lastThread?.Abort();
+                lastThread?.Interrupt();
             }
 
             if (CoreModule.Settings.LazyLoading) {
-                MainThreadHelper.Do(() => VirtualContentExt.UnloadOverworld());
+                MainThreadHelper.Schedule(() => patch_VirtualContent.UnloadOverworld());
             }
 
             // Vanilla TileToIndex mappings.
@@ -81,11 +86,14 @@ namespace Celeste {
             // Clear any custom tileset sound paths
             patch_SurfaceIndex.IndexToCustomPath.Clear();
 
+            // Clear any sound parameter overrides
+            patch_SurfaceIndex.IndexToSoundParam.Clear();
+
             string path = "";
 
             try {
-                AreaData area = AreaData.Get(session);
-                MapMeta meta = area.GetMeta();
+                patch_AreaData area = patch_AreaData.Get(session);
+                MapMeta meta = area.Meta;
 
                 path = meta?.BackgroundTiles;
                 if (string.IsNullOrEmpty(path))
@@ -124,8 +132,52 @@ namespace Celeste {
                         SpriteData valueMod = kvpBank.Value;
 
                         if (bankOrig.SpriteData.TryGetValue(key, out SpriteData valueOrig)) {
-                            IDictionary animsOrig = valueOrig.Sprite.GetAnimations();
-                            IDictionary animsMod = valueMod.Sprite.GetAnimations();
+                            // in order to allow map metadata Sprites.xml to override sprite origin and position, we
+                            // need to manually copy the property from the map metadata sprites onto the main spritebank
+                            // (done only if the overriding Sprites.xml specifies a value for that property)
+                            
+                            bool foundOrigin = false; // Center, Justify, Origin are all ways to specify the origin
+                            bool foundPosition = false;
+                            
+                            // iterate through the sources list, starting from the end (the most recently added source
+                            // setting a particular type of property is used)
+                            for (int i = valueMod.Sources.Count - 1; i >= 0; i--) {
+                                XmlElement xml = valueMod.Sources[i].XML;
+                                
+                                if (xml != null) {
+                                    // based on SpriteData.Add()
+                                    if (!foundOrigin) {
+                                        if (xml.HasChild("Center")) {
+                                            valueOrig.Sprite.CenterOrigin();
+                                            valueOrig.Sprite.Justify = new Vector2(0.5f, 0.5f);
+                                            foundOrigin = true;
+                                        }
+                                        else if (xml.HasChild("Justify")) {
+                                            valueOrig.Sprite.JustifyOrigin(xml.ChildPosition("Justify"));
+                                            valueOrig.Sprite.Justify = xml.ChildPosition("Justify");
+                                            foundOrigin = true;
+                                        }
+                                        else if (xml.HasChild("Origin")) {
+                                            valueOrig.Sprite.Origin = xml.ChildPosition("Origin");
+                                            foundOrigin = true;
+                                        }
+                                    }
+
+                                    if (!foundPosition) {
+                                        if (xml.HasChild("Position")) {
+                                            valueOrig.Sprite.Position = xml.ChildPosition("Position");
+                                            foundPosition = true;
+                                        }
+                                    }
+
+                                    if (foundOrigin && foundPosition) {
+                                        break;
+                                    }
+                                }
+                            }
+
+                            IDictionary animsOrig = ((patch_Sprite) valueOrig.Sprite).Animations;
+                            IDictionary animsMod = ((patch_Sprite) valueMod.Sprite).Animations;
                             foreach (DictionaryEntry kvpAnim in animsMod) {
                                 animsOrig[kvpAnim.Key] = kvpAnim.Value;
                             }
@@ -156,20 +208,19 @@ namespace Celeste {
                     path = Path.Combine("Graphics", "Portraits.xml");
                 GFX.PortraitsSpriteBank = new SpriteBank(GFX.Portraits, path);
             } catch (Exception e) {
-                string sid = session?.Area.GetSID() ?? "NULL";
                 if (patch_LevelEnter.ErrorMessage == null) {
                     if (e is XmlException) {
                         patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_xmlerror").Replace("((path))", path);
-                        Logger.Log(LogLevel.Warn, "LevelLoader", $"Failed parsing {path}");
+                        Logger.Warn("LevelLoader", $"Failed parsing {path}");
                     } else if (e.TypeInStacktrace(typeof(Autotiler))) {
                         patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_tilexmlerror").Replace("((path))", path);
-                        Logger.Log(LogLevel.Warn, "LevelLoader", $"Failed parsing tileset tag in {path}");
+                        Logger.Warn("LevelLoader", $"Failed parsing tileset tag in {path}");
                     } else {
                         patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_levelloadfailed").Replace("((sid))", sid);
                     }
                 }
-                Logger.Log(LogLevel.Warn, "LevelLoader", $"Failed loading {sid}");
-                e.LogDetailed();
+                Logger.Warn("LevelLoader", $"Failed loading {sid}{mapName}");
+                Logger.LogDetailed(e);
             }
 
             orig_ctor(session, startPosition);
@@ -195,7 +246,7 @@ namespace Celeste {
 
         [MonoModIgnore] // We don't want to change anything about the method...
         [PatchLoadingThreadAddEvent] // ... except for manually manipulating the method via MonoModRules
-        [PatchLoadingThreadAddSubHudRenderer] 
+        [PatchLoadingThreadAddSubHudRenderer]
         private extern void LoadingThread();
 
         private void LoadingThread_Safe() {
@@ -203,6 +254,10 @@ namespace Celeste {
                 LoadingThread();
             } catch (Exception e) {
                 string sid = session?.Area.GetSID() ?? "NULL";
+                string mapName = session?.Area != null && Dialog.Has(mapName = AreaData.Get(session.Area).Name) ? $" [{Dialog.Clean(mapName, Dialog.Languages["english"])}]" : null;
+                if (session?.Area.Mode > 0)
+                    mapName = mapName + $" [{session.Area.Mode}]";
+
                 if (patch_LevelEnter.ErrorMessage == null) {
                     if (e is AutotilerException ex && e.Source == "TileHandler") {
                         string room = "???";
@@ -214,24 +269,24 @@ namespace Celeste {
                                 break;
                             }
                         }
-                        
+
                         string type = "";
                         if (e.TypeInStacktrace(typeof(SolidTiles))) {
                             type = "fg";
                         } else if (e.TypeInStacktrace(typeof(BackgroundTiles))) {
                             type = "bg";
                         }
-                        
+
                         patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_badtileid")
                             .Replace("((type))", type).Replace("((id))", ex.ID.ToString()).Replace("((x))", ex.X.ToString())
                             .Replace("((y))", ex.Y.ToString()).Replace("((room))", room).Replace("((sid))", sid);
-                        Logger.Log(LogLevel.Warn, "LevelLoader", $"Undefined tile id '{ex.ID}' at ({ex.X}, {ex.Y}) in room {room}");
+                        Logger.Warn("LevelLoader", $"Undefined tile id '{ex.ID}' at ({ex.X}, {ex.Y}) in room {room}");
                     } else {
                         patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_levelloadfailed").Replace("((sid))", sid);
                     }
                 }
-                Logger.Log(LogLevel.Warn, "LevelLoader", $"Failed loading {sid}");
-                e.LogDetailed();
+                Logger.Warn("LevelLoader", $"Failed loading {sid}{mapName}");
+                Logger.LogDetailed(e);
                 Loaded = true;
             }
         }
@@ -248,9 +303,20 @@ namespace Celeste {
             base_Update();
             if (Loaded && !started) {
                 if (patch_LevelEnter.ErrorMessage == null) {
-                    StartLevel();
-                }
-                else {
+                    try {
+                        StartLevel();
+                    } catch (Exception e) {
+                        string SID = session.Area.GetSID();
+                        string mapName = Dialog.Has(mapName = AreaData.Get(session.Area).Name) ? $" [{Dialog.Clean(mapName, Dialog.Languages["english"])}]" : null;
+                        if (session.Area.Mode > 0)
+                            mapName = mapName + $" [{session.Area.Mode}]";
+
+                        patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_levelloadfailed").Replace("((sid))", SID);
+                        Logger.Warn("LevelLoader", $"Failed Starting Level at room {session.Level} of '{SID}{mapName}'");
+                        Logger.LogDetailed(e);
+                        LevelEnter.Go(session, false);
+                    }
+                } else {
                     LevelEnter.Go(session, false); // We encountered an error, so display the error screen
                 }
             }

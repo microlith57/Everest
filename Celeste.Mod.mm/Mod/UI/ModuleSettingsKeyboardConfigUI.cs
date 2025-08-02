@@ -1,8 +1,7 @@
-﻿using Microsoft.Xna.Framework.Input;
-using Monocle;
+﻿using Monocle;
 using MonoMod;
-using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 
 namespace Celeste.Mod {
@@ -15,6 +14,18 @@ namespace Celeste.Mod {
 
         public ModuleSettingsKeyboardConfigUI(EverestModule module) {
             Module = module;
+
+            if (Engine.Scene is Level level) {
+                bool? oldAllowHudHide = null;
+                OnUpdate = () => {
+                    if (oldAllowHudHide == null) {
+                        oldAllowHudHide = level.AllowHudHide;
+                        level.AllowHudHide = false;
+                        // Mods may will reset the initial value of OnClose after ctor and cause this to not work. so lets the later OnUpdate add this for OnClose.
+                        OnClose += () => level.AllowHudHide = oldAllowHudHide.Value;
+                    }
+                };
+            }
             // Base already reloads too early before the module has been set.
             Reload(2);
         }
@@ -58,11 +69,11 @@ namespace Celeste.Mod {
                     DefaultButtonBindingAttribute defaults = prop.GetCustomAttribute<DefaultButtonBindingAttribute>();
 
                     Bindings.Add(new ButtonBindingEntry(binding, defaults));
-                    
+
                     string subheader = prop.GetCustomAttribute<SettingSubHeaderAttribute>()?.SubHeader;
                     if (subheader != null)
                         Add(new SubHeader(subheader.DialogCleanOrNull() ?? subheader));
-                    
+
                     AddMapForceLabel(name, binding.Binding);
                 }
             }
@@ -80,9 +91,14 @@ namespace Celeste.Mod {
 
         public override void Reset() {
             foreach (ButtonBindingEntry entry in Bindings) {
-                entry.Binding.Binding.Keyboard.Clear();
-                if (entry.Defaults != null && entry.Defaults.Key != 0)
-                    entry.Binding.Binding.Keyboard.Add(entry.Defaults.Key);
+                Binding binding = entry.Binding.Binding;
+                binding.Keyboard.Clear();
+                if (entry.Defaults is { } defaults) {
+                    if (defaults.Key != 0)
+                        binding.Keyboard.Add(defaults.Key);
+                    if (defaults.Keys != null)
+                        binding.Add(defaults.Keys.Where(k => k != 0).ToArray());
+                }
             }
             Input.Initialize();
             Reload(Selection);

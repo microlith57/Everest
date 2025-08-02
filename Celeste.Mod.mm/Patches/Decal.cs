@@ -1,4 +1,4 @@
-﻿#pragma warning disable CS0626 // Method, operator, or accessor is marked external and has no attributes on it
+#pragma warning disable CS0626 // Method, operator, or accessor is marked external and has no attributes on it
 #pragma warning disable CS0414 // The field is assigned but its value is never used
 
 using Celeste.Mod;
@@ -17,6 +17,7 @@ using Mono.Cecil.Cil;
 using MonoMod.Cil;
 using MonoMod.Utils;
 using MonoMod.InlineRT;
+using Celeste.Mod.Helpers;
 
 namespace Celeste {
     class patch_Decal : Decal {
@@ -32,6 +33,12 @@ namespace Celeste {
 #pragma warning restore CS0649
 
         public float Rotation = 0f;
+
+        public Color Color;
+
+#pragma warning disable CS0649
+        public bool DepthSetByPlacement;
+#pragma warning restore CS0649
 
         private bool scaredAnimal;
 
@@ -57,7 +64,7 @@ namespace Celeste {
             }
 
             [MonoModIgnore]
-            [PatchDecalImageRotation]
+            [PatchDecalImageRender]
             public extern override void Render();
 
         }
@@ -70,7 +77,7 @@ namespace Celeste {
             }
 
             [MonoModIgnore]
-            [PatchDecalImageRotation]
+            [PatchDecalImageRender]
             public extern override void Render();
 
         }
@@ -82,7 +89,7 @@ namespace Celeste {
             }
 
             [MonoModIgnore]
-            [PatchDecalImageRotation]
+            [PatchDecalImageRender]
             public extern override void Render();
 
         }
@@ -109,7 +116,7 @@ namespace Celeste {
 
             public override void Render() {
                 if (activeTextures.Count > 0)
-                    activeTextures[(int) frame % activeTextures.Count].DrawCentered(Decal.Position, Color.White, Decal.scale, Decal.Rotation);
+                    activeTextures[(int) frame % activeTextures.Count].DrawCentered(Decal.Position, Decal.Color, Decal.scale, Decal.Rotation);
             }
         }
 
@@ -123,14 +130,21 @@ namespace Celeste {
             hideRange = 32f;
             showRange = 48f;
             solids = new List<Solid>();
+            Color = Color.White;
 
             orig_ctor(texture, position, scale, depth);
         }
 
         [MonoModConstructor]
-        public void ctor(string texture, Vector2 position, Vector2 scale, int depth, float rotation) {
+        public void ctor(string texture, Vector2 position, Vector2 scale, int depth, float rotation, Color color) {
             ctor(texture, position, scale, depth);
             Rotation = MathHelper.ToRadians(rotation);
+            Color = color;
+        }
+
+        [MonoModConstructor]
+        public void ctor(string texture, Vector2 position, Vector2 scale, int depth, float rotation, string color_hex) {
+            ctor(texture, position, scale, depth, rotation, patch_Calc.HexToColorWithAlpha(color_hex));
         }
 
         [MonoModIgnore]
@@ -217,16 +231,20 @@ namespace Celeste {
                 },
                 OnShake = v => Position += v,
                 OnAttach = p => {
-                    p.Add(new EntityRemovedListener(() => { 
+                    p.Add(new EntityRemovedListener(() => {
                         RemoveSelf();
                         solids.ForEach(s => s.RemoveSelf());
                     }));
-                    CoreModule.Session.AttachedDecals.Add($"{Name}||{Position.X}||{Position.Y}");
+                    CoreModule.Session.AttachedDecals.Add(string.Format("{0}||{1}||{2}", Name, Position.X, Position.Y));
                 }
             };
             if (jumpThrus)
                 staticMover.JumpThruChecker = s => s.CollideRect(new Rectangle((int) X + x, (int) X + y, w, h));
             Add(staticMover);
+        }
+
+        public void MakeAnimation(int[] frames) {
+            textures = frames.Select(i => textures[i]).ToList();
         }
 
         public void MakeScaredAnimation(int hideRange, int showRange, int[] idleFrames, int[] hiddenFrames, int[] showFrames, int[] hideFrames) {
@@ -260,45 +278,48 @@ namespace Celeste {
 
         public override void Awake(Scene scene) {
             base.Awake(scene);
-            if (staticMover?.Platform == null && CoreModule.Session.AttachedDecals.Contains($"{Name}||{Position.X}||{Position.Y}")) {
+            if (staticMover?.Platform == null && CoreModule.Session.AttachedDecals.Contains(string.Format("{0}||{1}||{2}", Name, Position.X, Position.Y))) {
                 RemoveSelf();
             }
         }
 
         public extern void orig_Added(Scene scene);
         public override void Added(Scene scene) {
+            int depth = Depth;
+
             orig_Added(scene);
+
+            if (DepthSetByPlacement)
+                Depth = depth;
+
             // Handle the Decal Registry
             string text = Name.ToLower();
-            if (text.StartsWith("decals/")) {
+            if (text.StartsWith("decals/", StringComparison.Ordinal)) {
                 text = text.Substring(7);
             }
-            if (DecalRegistry.RegisteredDecals.ContainsKey(text)) {
-                Remove(image);
-                image = null;
-                DecalRegistry.DecalInfo info = DecalRegistry.RegisteredDecals[text];
 
-                // Handle properties. Apply "scale" first since it affects other properties.
-                foreach (KeyValuePair<string, XmlAttributeCollection> property in info.CustomProperties.OrderByDescending(p => p.Equals("scale"))) {
-                    if (DecalRegistry.PropertyHandlers.ContainsKey(property.Key)) {
-                        try {
-                            DecalRegistry.PropertyHandlers[property.Key].Invoke(this, property.Value);
-                        } catch (Exception e) {
-                            patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_decalregerror").Replace("((property))", property.Key).Replace("((decal))", text);
-                            Logger.Log(LogLevel.Warn, "Decal Registry", $"Failed to apply property '{property.Key}' to {text}");
-                            e.LogDetailed();
-                        }
-                        
-                    } else {
-                        Logger.Log(LogLevel.Warn, "Decal Registry", $"Unknown property {property.Key} in decal {text}");
-                    }
+            if (!DecalRegistry.RegisteredDecals.TryGetValue(text, out DecalRegistry.DecalInfo info))
+                return;
+            
+            Remove(image);
+            image = null;
+            
+            // apply all decal registry handlers.
+            foreach (var handler in info.Handlers) {
+                try {
+                    handler.ApplyTo(this);
+                } catch (Exception e) {
+                    patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_decalregerror")
+                        .Replace("((property))", handler.Name)
+                        .Replace("((decal))", text);
+                    Logger.Warn("Decal Registry", $"Failed to apply property '{handler.Name}' to {text}");
+                    Logger.LogDetailed(e);
                 }
+            }
 
-                Everest.Events.Decal.HandleDecalRegistry(this, info);
-                if (image == null) {
-                    Add(image = new patch_DecalImage());
-                }
-
+            Everest.Events.Decal.HandleDecalRegistry(this, info);
+            if (image == null) {
+                Add(image = new patch_DecalImage());
             }
         }
 
@@ -319,8 +340,10 @@ namespace Celeste {
 
     public static class DecalExt {
 
+        [Obsolete("Use Decal.Scale instead.")]
         public static Vector2 GetScale(this Decal self)
             => ((patch_Decal) self).Scale;
+        [Obsolete("Use Decal.Scale instead.")]
         public static void SetScale(this Decal self, Vector2 value)
             => ((patch_Decal) self).Scale = value;
 
@@ -337,8 +360,8 @@ namespace MonoMod {
     /// <summary>
     /// Allow decal images to be rotated.
     /// </summary>
-    [MonoModCustomMethodAttribute(nameof(MonoModRules.PatchDecalImageRotation))]
-    class PatchDecalImageRotationAttribute : Attribute { }
+    [MonoModCustomMethodAttribute(nameof(MonoModRules.PatchDecalImageRender))]
+    class PatchDecalImageRenderAttribute : Attribute { }
 
     /// <summary>
     /// Allow mirror masks to be rotated.
@@ -364,10 +387,13 @@ namespace MonoMod {
             cursor.Emit(OpCodes.Ldfld, f_showRange);
         }
 
-        public static void PatchDecalImageRotation(ILContext context, CustomAttribute attrib) {
+        public static void PatchDecalImageRender(ILContext context, CustomAttribute attrib) {
             TypeDefinition t_Decal = MonoModRule.Modder.FindType("Celeste.Decal").Resolve();
             TypeDefinition t_MTexture = MonoModRule.Modder.FindType("Monocle.MTexture").Resolve();
+
             FieldReference f_Decal_Rotation = t_Decal.FindField("Rotation");
+            FieldReference f_Decal_Color = t_Decal.FindField("Color");
+
             MethodReference m_get_Decal = null;
             MethodReference m_Draw_old = null;
 
@@ -390,6 +416,17 @@ namespace MonoMod {
             cursor.Emit(OpCodes.Ldfld, f_Decal_Rotation);
             // ...and replace the draw call to accept it
             cursor.Emit(OpCodes.Callvirt, m_Draw_new);
+            cursor.Remove();
+
+            // go back to the start
+            cursor.Index = 0;
+
+            // move to just before the colour white is obtained, and replace it with some other colour
+            cursor.GotoNext(MoveType.Before, instr => instr.MatchCallOrCallvirt(out MethodReference method)
+                                                   && method.FullName == "Microsoft.Xna.Framework.Color Microsoft.Xna.Framework.Color::get_White()");
+            cursor.Emit(OpCodes.Ldarg_0);
+            cursor.Emit(OpCodes.Callvirt, m_get_Decal);
+            cursor.Emit(OpCodes.Ldfld, f_Decal_Color);
             cursor.Remove();
         }
 

@@ -1,8 +1,13 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFrameworks>net452</TargetFrameworks>
+    <TargetFramework>net8.0</TargetFramework>
     <AssemblyName>DiscordGameSDK</AssemblyName>
     <RootNamespace>Discord</RootNamespace>
     <LangVersion>9</LangVersion>
+  </PropertyGroup>
+
+  <!-- Anonymize paths -->
+  <PropertyGroup>
+    <PathMap>$(MSBuildProjectDirectory)=DiscordGameSDK/</PathMap>
   </PropertyGroup>
 </Project>

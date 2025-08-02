@@ -1,12 +1,19 @@
-﻿using Microsoft.Xna.Framework;
+﻿using Celeste.Mod.UI;
+using Microsoft.Xna.Framework;
 using System;
 using System.Collections.Generic;
 using _Decal = Celeste.Decal;
 using _EventTrigger = Celeste.EventTrigger;
+using _LevelLoader = Celeste.LevelLoader;
 using _Level = Celeste.Level;
+using _Session = Celeste.Session;
 using _OuiJournal = Celeste.OuiJournal;
 using _OuiMainMenu = Celeste.OuiMainMenu;
 using _Player = Celeste.Player;
+using _Seeker = Celeste.Seeker;
+using _AngryOshiro = Celeste.AngryOshiro;
+using _SubHudRenderer = Celeste.Mod.UI.SubHudRenderer;
+using Monocle;
 
 namespace Celeste.Mod {
     public static partial class Everest {
@@ -14,6 +21,21 @@ namespace Celeste.Mod {
         /// Events that are called at various points in the game.
         /// </summary>
         public static class Events {
+
+            public static event Action<CriticalErrorHandler> OnCriticalError;
+            internal static void CriticalError(CriticalErrorHandler handler) {
+                if (OnCriticalError == null)
+                    return;
+
+                foreach (Action<CriticalErrorHandler> deleg in OnCriticalError.GetInvocationList()) {
+                    try {
+                        deleg(handler);
+                    } catch (Exception ex) {
+                        Logger.Error("crit-error-handler", $"Error invoking critical error event handler {deleg.Method}:");
+                        Logger.LogDetailed(ex, "crit-error-handler");
+                    }
+                }
+            }
 
             public static class Celeste {
                 /// <summary>
@@ -75,8 +97,10 @@ namespace Celeste.Mod {
             public static class LevelLoader {
                 public delegate void LoadingThreadHandler(_Level level);
                 /// <summary>
-                /// Called at the end of the map loading thread.
+                /// Called at the end of the map loading thread, <see cref="_LevelLoader.LoadingThread()"/>.<br/>
+                /// This event is invoked <b>only once</b>, when entering a map from the chapter select screen or from Save and Quit.
                 /// </summary>
+                /// <seealso cref="Level.OnLoadLevel"/>
                 public static event LoadingThreadHandler OnLoadingThread;
                 internal static void LoadingThread(_Level level)
                     => OnLoadingThread?.Invoke(level);
@@ -98,12 +122,12 @@ namespace Celeste.Mod {
                 public static event UnpauseHandler OnUnpause;
                 internal static void Unpause(_Level level) => OnUnpause?.Invoke(level);
 
-                public delegate void CreatePauseMenuButtonsHandler(_Level level, TextMenu menu, bool minimal);
+                public delegate void CreatePauseMenuButtonsHandler(_Level level, patch_TextMenu menu, bool minimal);
                 /// <summary>
                 /// Called when the Level's pause menu is created.
                 /// </summary>
                 public static event CreatePauseMenuButtonsHandler OnCreatePauseMenuButtons;
-                internal static void CreatePauseMenuButtons(_Level level, TextMenu menu, bool minimal)
+                internal static void CreatePauseMenuButtons(_Level level, patch_TextMenu menu, bool minimal)
                     => OnCreatePauseMenuButtons?.Invoke(level, menu, minimal);
 
                 public delegate void TransitionToHandler(_Level level, LevelData next, Vector2 direction);
@@ -140,24 +164,35 @@ namespace Celeste.Mod {
                     => OnLoadBackdrop?.InvokeWhileNull<Backdrop>(map, child, above);
 
                 public delegate void LoadLevelHandler(_Level level, _Player.IntroTypes playerIntro, bool isFromLoader);
+                /// <summary>
+                /// Called after <see cref="_Level.LoadLevel"/>.<br/>
+                /// This event is invoked <b>every time</b> a room is entered - transition, respawn, teleport, etc.
+                /// </summary>
+                /// <seealso cref="LevelLoader.OnLoadingThread"/>
                 public static event LoadLevelHandler OnLoadLevel;
                 internal static void LoadLevel(_Level level, _Player.IntroTypes playerIntro, bool isFromLoader)
                     => OnLoadLevel?.Invoke(level, playerIntro, isFromLoader);
 
-                public delegate void EnterHandler(Session session, bool fromSaveData);
+                public delegate void EnterHandler(_Session session, bool fromSaveData);
                 public static event EnterHandler OnEnter;
-                internal static void Enter(Session session, bool fromSaveData)
+                internal static void Enter(_Session session, bool fromSaveData)
                     => OnEnter?.Invoke(session, fromSaveData);
 
-                public delegate void ExitHandler(_Level level, LevelExit exit, LevelExit.Mode mode, Session session, HiresSnow snow);
+                public delegate void ExitHandler(_Level level, LevelExit exit, LevelExit.Mode mode, _Session session, HiresSnow snow);
                 public static event ExitHandler OnExit;
-                internal static void Exit(_Level level, LevelExit exit, LevelExit.Mode mode, Session session, HiresSnow snow)
+                internal static void Exit(_Level level, LevelExit exit, LevelExit.Mode mode, _Session session, HiresSnow snow)
                     => OnExit?.Invoke(level, exit, mode, session, snow);
 
                 public delegate void CompleteHandler(_Level level);
                 public static event CompleteHandler OnComplete;
                 internal static void Complete(_Level level)
                     => OnComplete?.Invoke(level);
+            }
+
+            public static class Session {
+                public static event Action<patch_Session, patch_Session.Slider, float?> OnSliderChanged;
+                internal static void SliderChanged(patch_Session session, patch_Session.Slider slider, float? previous)
+                    => OnSliderChanged?.Invoke(session, slider, previous);
             }
 
             public static class Player {
@@ -168,6 +203,22 @@ namespace Celeste.Mod {
                 public static event Action<_Player> OnDie;
                 internal static void Die(_Player player)
                     => OnDie?.Invoke(player);
+
+                public static event Action<_Player> OnRegisterStates;
+                internal static void RegisterStates(_Player player)
+                    => OnRegisterStates?.Invoke(player);
+            }
+
+            public static class Seeker {
+                public static event Action<_Seeker> OnRegisterStates;
+                internal static void RegisterStates(_Seeker seeker)
+                    => OnRegisterStates?.Invoke(seeker);
+            }
+
+            public static class AngryOshiro {
+                public static event Action<_AngryOshiro> OnRegisterStates;
+                internal static void RegisterStates(_AngryOshiro oshiro)
+                    => OnRegisterStates?.Invoke(oshiro);
             }
 
             public static class Input {
@@ -241,6 +292,45 @@ namespace Celeste.Mod {
                 public static event ParseCommandHandler OnParseCommand;
                 internal static object ParseCommand(string command)
                     => OnParseCommand?.InvokeWhileNull<object>(command);
+            }
+
+            public static class AssetReload {
+                public delegate void ReloadHandler(bool silent);
+                public static event ReloadHandler OnBeforeReload, OnAfterReload;
+
+                public static event ReloadHandler OnBeforeNextReload, OnAfterNextReload;
+
+                internal static void BeforeReload(bool silent) {
+                    OnBeforeReload?.Invoke(silent);
+                    
+                    var beforeNextReload = OnBeforeNextReload;
+                    OnBeforeNextReload = null;
+                    beforeNextReload?.Invoke(silent);
+                }
+
+                internal static void AfterReload(bool silent) {
+                    OnAfterReload?.Invoke(silent);
+                    
+                    var afterNextReload = OnAfterNextReload;
+                    OnAfterNextReload = null;
+                    afterNextReload?.Invoke(silent);
+                }
+
+                public delegate void ReloadLevelHandler(global::Celeste.Level level);
+                public static ReloadLevelHandler OnReloadLevel;
+                internal static void ReloadLevel(global::Celeste.Level level)
+                    => OnReloadLevel?.Invoke(level);
+
+                public static Action OnReloadAllMaps;
+                internal static void ReloadAllMaps()
+                    => OnReloadAllMaps?.Invoke();
+            }
+
+            public static class SubHudRenderer {
+                public delegate void BeforeRenderHandler(_SubHudRenderer renderer, Scene scene);
+                public static event BeforeRenderHandler OnBeforeRender;
+                internal static void BeforeRender(_SubHudRenderer renderer, Scene scene)
+                    => OnBeforeRender?.Invoke(renderer, scene);
             }
         }
     }

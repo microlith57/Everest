@@ -4,37 +4,70 @@
 using Celeste.Mod;
 using Celeste.Mod.Core;
 using Celeste.Mod.Entities;
+using Celeste.Mod.Helpers;
 using Celeste.Mod.Meta;
 using Celeste.Mod.UI;
 using FMOD.Studio;
 using Microsoft.Xna.Framework;
+using Mono.Cecil;
+using Mono.Cecil.Cil;
 using Monocle;
 using MonoMod;
+using MonoMod.Cil;
+using MonoMod.InlineRT;
 using MonoMod.Utils;
 using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
-using Mono.Cecil;
-using Mono.Cecil.Cil;
-using MonoMod.Cil;
-using MonoMod.InlineRT;
-using Celeste.Mod.Helpers;
+using System.Runtime.CompilerServices;
 
 namespace Celeste {
     class patch_Level : Level {
 
         // We're effectively in GameLoader, but still need to "expose" private fields to our mod.
+        private float flash;
+
+        private Color flashColor = Color.White;
+
+        private bool doFlash;
+
+        private bool flashDrawPlayer;
+
         private static EventInstance PauseSnapshot;
         public static EventInstance _PauseSnapshot => PauseSnapshot;
 
         private static HashSet<string> _LoadStrings; // Generated in MonoModRules.PatchLevelLoader
 
         public SubHudRenderer SubHudRenderer;
-        public static Player NextLoadedPlayer;
-        public static int SkipScreenWipes;
-        public static bool ShouldAutoPause = false;
+
+        public class LoadOverride {
+
+            public Player NextLoadedPlayer = null;
+            public int SkipScreenWipes = 0;
+            public bool ShouldAutoPause = false;
+
+            public bool HasOverrides => NextLoadedPlayer != null || SkipScreenWipes != 0 || ShouldAutoPause;
+
+        }
+
+        private static readonly ConditionalWeakTable<Level, LoadOverride> LoadOverrides = new ConditionalWeakTable<Level, LoadOverride>();
+
+        /// <summary>
+        /// Registers an override of some level load parameters. Only one
+        /// override can be registered for each level.
+        /// </summary>
+        /// <param name="level">The level for which to register the override</param>
+        /// <param name="loadOverride">The override data to register</param>
+        public static void RegisterLoadOverride(Level level, LoadOverride loadOverride) {
+            if (loadOverride.HasOverrides)
+                LoadOverrides.Add(level, loadOverride);
+        }
+
+        [Obsolete("Use RegisterLoadOverride instead")] public static Player NextLoadedPlayer;
+        [Obsolete("Use RegisterLoadOverride instead")] public static int SkipScreenWipes;
+        [Obsolete("Use RegisterLoadOverride instead")] public static bool ShouldAutoPause = false;
 
         public delegate Entity EntityLoader(Level level, LevelData levelData, Vector2 offset, EntityData entityData);
         public static readonly Dictionary<string, EntityLoader> EntityLoaders = new Dictionary<string, EntityLoader>();
@@ -68,6 +101,21 @@ namespace Celeste {
         [MonoModIgnore] // We don't want to change anything about the method...
         [PatchLevelUpdate] // ... except for manually manipulating the method via MonoModRules
         public extern new void Update();
+
+        /// <summary>
+        /// Flash the screen a solid color. Respects the user's advanced photosensitivity settings.
+        /// </summary>
+        /// <param name="color"></param>
+        /// <param name="drawPlayerOver">Whether the player should render over the flash.</param>
+        [MonoModReplace] // We copy the entirety of this method instead of doing an IL patch because it's 5 lines of code.
+        public new void Flash(Color color, bool drawPlayerOver = false) {
+            if (CoreModule.Settings.AllowScreenFlash) {
+                doFlash = true;
+                flashDrawPlayer = drawPlayerOver;
+                flash = 1f;
+                flashColor = color;
+            }
+        }
 
         [MonoModReplace]
         public new void RegisterAreaComplete() {
@@ -104,9 +152,21 @@ namespace Celeste {
         /// <param name="onComplete"></param>
         /// <param name="hiresSnow"></param>
         public new void DoScreenWipe(bool wipeIn, Action onComplete = null, bool hiresSnow = false) {
-            if (onComplete == null && !hiresSnow && SkipScreenWipes > 0) {
-                SkipScreenWipes--;
-                return;
+            if (onComplete == null && !hiresSnow) {
+                // Check if we should skip the screen wipe
+#pragma warning disable 0618
+                if (SkipScreenWipes > 0) {
+                    SkipScreenWipes--;
+                    return;
+                }
+#pragma warning restore 0618
+
+                if (LoadOverrides.TryGetValue(this, out LoadOverride ovr) && ovr.SkipScreenWipes > 0) {
+                    ovr.SkipScreenWipes--;
+                    if (!ovr.HasOverrides)
+                        LoadOverrides.Remove(this);
+                    return;
+                }
             }
 
             orig_DoScreenWipe(wipeIn, onComplete, hiresSnow);
@@ -127,7 +187,7 @@ namespace Celeste {
         public new void Pause(int startIndex = 0, bool minimal = false, bool quickReset = false) {
             orig_Pause(startIndex, minimal, quickReset);
 
-            if (Entities.GetToAdd().FirstOrDefault(e => e is TextMenu) is TextMenu menu) {
+            if (((patch_EntityList) (object) Entities).ToAdd.FirstOrDefault(e => e is TextMenu) is patch_TextMenu menu) {
                 void Unpause() {
                     Everest.Events.Level.Unpause(this);
                 }
@@ -140,6 +200,20 @@ namespace Celeste {
             }
 
             Everest.Events.Level.Pause(this, startIndex, minimal, quickReset);
+        }
+
+        /// <summary>
+        /// Forcefully close the pause menu; resume from paused.
+        /// </summary>
+        public void Unpause() {
+            if (Paused) {
+                PauseMainMenuOpen = false;
+                if (Entities.FindFirst<TextMenu>() is patch_TextMenu menu)
+                    menu.CloseAndRun(Everest.SaveSettings(), null);
+                Paused = false;
+                Audio.Play("event:/ui/game/unpause");
+                unpauseTimer = 0.15f;
+            }
         }
 
         public extern void orig_TransitionTo(LevelData next, Vector2 direction);
@@ -203,18 +277,40 @@ namespace Celeste {
             if (Session.FirstLevel && Session.StartedFromBeginning && Session.JustStarted
                 && (!(Engine.Scene is LevelLoader loader) || !loader.PlayerIntroTypeOverride.HasValue)
                 && Session.Area.Mode == AreaMode.CSide
-                && AreaData.GetMode(Session.Area)?.GetMapMeta() is MapMeta mapMeta && (mapMeta.OverrideASideMeta ?? false)
+                && (AreaData.GetMode(Session.Area) as patch_ModeProperties)?.MapMeta is MapMeta mapMeta && (mapMeta.OverrideASideMeta ?? false)
                 && mapMeta.IntroType is Player.IntroTypes introType)
                 playerIntro = introType;
 
+            string mapName = Dialog.Has(mapName = AreaData.Get(Session.Area).Name) ? $" [{Dialog.Clean(mapName, Dialog.Languages["english"])}]" : null;
+            if (Session.Area.Mode > 0)
+                mapName = mapName + $" [{Session.Area.Mode}]";
             try {
-                Logger.Log(LogLevel.Verbose, "LoadLevel", $"Loading room {Session.LevelData.Name} of {Session.Area.GetSID()}");
+                if (string.IsNullOrEmpty(Session.Level)) {
+                    patch_LevelEnter.ErrorMessage = Dialog.Get("postcard_levelnorooms");
+                    throw new NullReferenceException("Current map has no rooms.");
+                }
+                Logger.Verbose("LoadLevel", $"Loading room {Session.LevelData.Name} of '{Session.Area.GetSID()}{mapName}'");
 
                 orig_LoadLevel(playerIntro, isFromLoader);
 
+                // Check if we should auto-pause
+#pragma warning disable 0618
                 if (ShouldAutoPause) {
                     ShouldAutoPause = false;
                     Pause();
+                }
+#pragma warning restore 0618
+
+                if (LoadOverrides.TryGetValue(this, out LoadOverride ovr) && ovr.ShouldAutoPause) {
+                    ovr.ShouldAutoPause = false;
+                    if (!ovr.HasOverrides)
+                        LoadOverrides.Remove(this);
+
+                    Pause();
+                }
+
+                if (Session.Area.GetLevelSet() != "Celeste") {
+                    CameraUpwardMaxY = Camera.Y + 180f; // prevent badeline orb camera lock data persisting through screen transitions
                 }
             } catch (Exception e) {
                 if (patch_LevelEnter.ErrorMessage == null) {
@@ -225,8 +321,8 @@ namespace Celeste {
                     }
                 }
 
-                Logger.Log(LogLevel.Warn, "LoadLevel", $"Failed loading room {Session.LevelData.Name} of {Session.Area.GetSID()}");
-                e.LogDetailed();
+                Logger.Warn("LoadLevel", $"Failed loading room {Session.Level} of '{Session.Area.GetSID()}{mapName}'");
+                Logger.LogDetailed(e);
                 return;
             }
             Everest.Events.Level.LoadLevel(this, playerIntro, isFromLoader);
@@ -238,7 +334,7 @@ namespace Celeste {
                 return levelMode;
             }
 
-            MapMetaModeProperties properties = Session.MapData.GetMeta();
+            MapMetaModeProperties properties = ((patch_MapData) Session.MapData).Meta;
             if (properties != null && (properties.HeartIsEnd ?? false)) {
                 // heart ends the level: this is like B-Sides.
                 // the heart will appear even if it was collected, to avoid a softlock if we save & quit after collecting it.
@@ -250,17 +346,64 @@ namespace Celeste {
             }
         }
 
-        // Called from LoadLevel, patched via MonoModRules.PatchLevelLoader
+        [ThreadStatic] private static Player _PlayerOverride;
+
+        [Obsolete("Use LoadNewPlayerForLevel instead")] // Some mods hook this method ._.
         private static Player LoadNewPlayer(Vector2 position, PlayerSpriteMode spriteMode) {
+            if (_PlayerOverride != null)
+                return _PlayerOverride;
+
+#pragma warning disable 0618
             Player player = NextLoadedPlayer;
             if (player != null) {
                 NextLoadedPlayer = null;
                 return player;
             }
+#pragma warning restore 0618
 
             return new Player(position, spriteMode);
         }
 
+        // Called from LoadLevel, patched via MonoModRules.PatchLevelLoader
+        private static Player LoadNewPlayerForLevel(Vector2 position, PlayerSpriteMode spriteMode, Level lvl) {
+            // Check if there is a player override
+            if (LoadOverrides.TryGetValue(lvl, out LoadOverride ovr) && ovr.NextLoadedPlayer != null) {
+                Player player = ovr.NextLoadedPlayer;
+
+                // Oh wait, you think we can just return the player override now?
+                // Some mods might depend on the old method being called! ._.
+                // (They might also depend on the exact semantics of NextLoadedPlayer holding the new player, but screw them in that case)
+                // (Their fault for hooking into a private Everest-internal method)
+#pragma warning disable 0618
+                try {
+                    _PlayerOverride = player;
+
+                    Player actualPlayer = LoadNewPlayer(position, spriteMode);
+                    if (actualPlayer != player)
+                        return actualPlayer;
+                } finally {
+                    _PlayerOverride = null;
+                }
+#pragma warning restore 0618
+
+                // The old method didn't object, actually apply the override now
+                ovr.NextLoadedPlayer = null;
+
+                if (!ovr.HasOverrides)
+                    LoadOverrides.Remove(lvl);
+
+                return player;
+            }
+
+            // Fall back to the obsolete overload
+#pragma warning disable 0618
+            return LoadNewPlayer(position, spriteMode);
+#pragma warning restore 0618
+        }
+
+        internal EntityID CreateEntityId(LevelData levelData, EntityData entityData)
+            => new EntityID(levelData.Name, entityData.ID + (_isLoadingTriggers ? 10000000 : 0));
+        
         /// <summary>
         /// Search for a custom entity that matches the <see cref="EntityData.Name"/>.<br/>
         /// To register a custom entity, use <see cref="CustomEntityAttribute"/> or <see cref="Everest.Events.Level.OnLoadEntity"/>.<br/>
@@ -273,143 +416,147 @@ namespace Celeste {
             LevelData levelData = level.Session.LevelData;
             Vector2 offset = new Vector2(levelData.Bounds.Left, levelData.Bounds.Top);
 
+            var prevStoredData = _currentEntityData;
+            
+            // We don't get access to the entity if it got created by this event,
+            // we'll let EntityList.Add set the entity data on the created entity.
+            _currentEntityData = entityData;
             if (Everest.Events.Level.LoadEntity(level, levelData, offset, entityData))
                 return true;
+            
+            // Now let's set this to null, as we have direct access to the entity and can set the entity data directly,
+            // avoiding the possibility of unrelated entities getting their EntityData set due to being added in a ctor
+            _currentEntityData = null;
+
+            Entity loaded = null;
 
             if (EntityLoaders.TryGetValue(entityData.Name, out EntityLoader loader)) {
-                Entity loaded = loader(level, levelData, offset, entityData);
-                if (loaded != null) {
-                    level.Add(loaded);
-                    return true;
+                loaded = loader(level, levelData, offset, entityData);
+            }
+
+            if (loaded == null) {
+                // The following entities have hardcoded "attributes."
+                // Everest allows custom maps to set them.
+                switch (entityData.Name) {
+                    case "everest/spaceController":
+                        loaded = new SpaceController();
+                        break;
+                    case "spinner":
+                        if (level.Session.Area.ID == 3 || (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) || entityData.Bool("dust")) {
+                            loaded = new DustStaticSpinner(entityData, offset);
+                            break;
+                        }
+
+                        CrystalColor color;
+                        switch (level.Session.Area.ID) {
+                            case 5:
+                                color = CrystalColor.Red;
+                                break;
+                            case 6:
+                                color = CrystalColor.Purple;
+                                break;
+                            case 10:
+                                color = CrystalColor.Rainbow;
+                                break;
+                            default: {
+                                if ("core".Equals(entityData.Attr("color"), StringComparison.InvariantCultureIgnoreCase))
+                                    color = (CrystalColor) (-1);
+                                else if (!Enum.TryParse(entityData.Attr("color"), true, out color))
+                                    color = CrystalColor.Blue;
+                                break;
+                            }
+                        }
+
+                        loaded = new CrystalStaticSpinner(entityData, offset, color);
+                        break;
+                    case "trackSpinner":
+                        if (level.Session.Area.ID == 10 || entityData.Bool("star")) {
+                            loaded = new StarTrackSpinner(entityData, offset);
+                            break;
+                        }
+                        if (level.Session.Area.ID == 3 || (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) || entityData.Bool("dust")) {
+                            loaded = new DustTrackSpinner(entityData, offset);
+                            break;
+                        }
+
+                        loaded = new BladeTrackSpinner(entityData, offset);
+                        break;
+                    case "rotateSpinner":
+                        if (level.Session.Area.ID == 10 || entityData.Bool("star")) {
+                            loaded = new StarRotateSpinner(entityData, offset);
+                            break;
+                        }
+                        if (level.Session.Area.ID == 3 || (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) || entityData.Bool("dust")) {
+                            loaded = new DustRotateSpinner(entityData, offset);
+                            break;
+                        }
+
+                        loaded = new BladeRotateSpinner(entityData, offset);
+                        break;
+                    case "checkpoint":
+                        if (entityData.Position == Vector2.Zero && !entityData.Bool("allowOrigin")) {
+                            // Workaround for mod levels with old versions of Ahorn containing a checkpoint at (0, 0):
+                            // Create the checkpoint and avoid the start position update in orig_Load.
+                            loaded = new Checkpoint(entityData, offset);
+                        }
+                        break;
+                    case "cloud": {
+                        patch_Cloud cloud = new Cloud(entityData, offset) as patch_Cloud;
+                        if (entityData.Has("small"))
+                            cloud.Small = entityData.Bool("small");
+                        loaded = cloud;
+                        break;
+                    }
+                    case "cobweb": {
+                        patch_Cobweb cobweb = new Cobweb(entityData, offset) as patch_Cobweb;
+                        if (entityData.Has("color"))
+                            cobweb.OverrideColors = entityData.Attr("color")?.Split(',').Select(s => Calc.HexToColor(s)).ToArray();
+                        loaded = cobweb;
+                        break;
+                    }
+                    case "movingPlatform": {
+                        patch_MovingPlatform platform = new MovingPlatform(entityData, offset) as patch_MovingPlatform;
+                        if (entityData.Has("texture"))
+                            platform.OverrideTexture = entityData.Attr("texture");
+                        loaded = platform;
+                        break;
+                    }
+                    case "sinkingPlatform": {
+                        patch_SinkingPlatform platform = new SinkingPlatform(entityData, offset) as patch_SinkingPlatform;
+                        if (entityData.Has("texture"))
+                            platform.OverrideTexture = entityData.Attr("texture");
+                        loaded = platform;
+                        break;
+                    }
+                    case "crumbleBlock": {
+                        patch_CrumblePlatform platform = new CrumblePlatform(entityData, offset) as patch_CrumblePlatform;
+                        if (entityData.Has("texture"))
+                            platform.OverrideTexture = entityData.Attr("texture");
+                        loaded = platform;
+                        break;
+                    }
+                    case "wire": {
+                        Wire wire = new Wire(entityData, offset);
+                        if (entityData.Has("color"))
+                            wire.Color = entityData.HexColor("color");
+                        loaded = wire;
+                        break;
+                    }
                 }
             }
-
-            if (entityData.Name == "everest/spaceController") {
-                level.Add(new SpaceController());
-                return true;
+            
+            if (loaded != null) {
+                ((patch_Entity)loaded).SourceData ??= entityData;
+                if (((patch_Entity)loaded).SourceId.Level is null)
+                    ((patch_Entity)loaded).SourceId = ((patch_Level) level).CreateEntityId(levelData, entityData);
+                
+                level.Add(loaded);
+            } else if (!_LoadStrings.Contains(entityData.Name)) {
+                Logger.Warn("LoadLevel", $"Failed loading entity {entityData.Name}. Room: {entityData.Level.Name} Position: {entityData.Position}");
             }
-
-            // The following entities have hardcoded "attributes."
-            // Everest allows custom maps to set them.
-
-            if (entityData.Name == "spinner") {
-                if (level.Session.Area.ID == 3 ||
-                    (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) ||
-                    entityData.Bool("dust")) {
-                    level.Add(new DustStaticSpinner(entityData, offset));
-                    return true;
-                }
-
-                CrystalColor color = CrystalColor.Blue;
-                if (level.Session.Area.ID == 5)
-                    color = CrystalColor.Red;
-                else if (level.Session.Area.ID == 6)
-                    color = CrystalColor.Purple;
-                else if (level.Session.Area.ID == 10)
-                    color = CrystalColor.Rainbow;
-                else if ("core".Equals(entityData.Attr("color"), StringComparison.InvariantCultureIgnoreCase))
-                    color = (CrystalColor) (-1);
-                else if (!Enum.TryParse(entityData.Attr("color"), true, out color))
-                    color = CrystalColor.Blue;
-
-                level.Add(new CrystalStaticSpinner(entityData, offset, color));
-                return true;
-            }
-
-            if (entityData.Name == "trackSpinner") {
-                if (level.Session.Area.ID == 10 ||
-                    entityData.Bool("star")) {
-                    level.Add(new StarTrackSpinner(entityData, offset));
-                    return true;
-                } else if (level.Session.Area.ID == 3 ||
-                    (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) ||
-                    entityData.Bool("dust")) {
-                    level.Add(new DustTrackSpinner(entityData, offset));
-                    return true;
-                }
-
-                level.Add(new BladeTrackSpinner(entityData, offset));
-                return true;
-            }
-
-            if (entityData.Name == "rotateSpinner") {
-                if (level.Session.Area.ID == 10 ||
-                    entityData.Bool("star")) {
-                    level.Add(new StarRotateSpinner(entityData, offset));
-                    return true;
-                } else if (level.Session.Area.ID == 3 ||
-                    (level.Session.Area.ID == 7 && level.Session.Level.StartsWith("d-")) ||
-                    entityData.Bool("dust")) {
-                    level.Add(new DustRotateSpinner(entityData, offset));
-                    return true;
-                }
-
-                level.Add(new BladeRotateSpinner(entityData, offset));
-                return true;
-            }
-
-            if (entityData.Name == "checkpoint" &&
-                entityData.Position == Vector2.Zero &&
-                !entityData.Bool("allowOrigin")) {
-                // Workaround for mod levels with old versions of Ahorn containing a checkpoint at (0, 0):
-                // Create the checkpoint and avoid the start position update in orig_Load.
-                level.Add(new Checkpoint(entityData, offset));
-                return true;
-            }
-
-            if (entityData.Name == "cloud") {
-                patch_Cloud cloud = new Cloud(entityData, offset) as patch_Cloud;
-                if (entityData.Has("small"))
-                    cloud.Small = entityData.Bool("small");
-                level.Add(cloud);
-                return true;
-            }
-
-            if (entityData.Name == "cobweb") {
-                patch_Cobweb cobweb = new Cobweb(entityData, offset) as patch_Cobweb;
-                if (entityData.Has("color"))
-                    cobweb.OverrideColors = entityData.Attr("color")?.Split(',').Select(s => Calc.HexToColor(s)).ToArray();
-                level.Add(cobweb);
-                return true;
-            }
-
-            if (entityData.Name == "movingPlatform") {
-                patch_MovingPlatform platform = new MovingPlatform(entityData, offset) as patch_MovingPlatform;
-                if (entityData.Has("texture"))
-                    platform.OverrideTexture = entityData.Attr("texture");
-                level.Add(platform);
-                return true;
-            }
-
-            if (entityData.Name == "sinkingPlatform") {
-                patch_SinkingPlatform platform = new SinkingPlatform(entityData, offset) as patch_SinkingPlatform;
-                if (entityData.Has("texture"))
-                    platform.OverrideTexture = entityData.Attr("texture");
-                level.Add(platform);
-                return true;
-            }
-
-            if (entityData.Name == "crumbleBlock") {
-                patch_CrumblePlatform platform = new CrumblePlatform(entityData, offset) as patch_CrumblePlatform;
-                if (entityData.Has("texture"))
-                    platform.OverrideTexture = entityData.Attr("texture");
-                level.Add(platform);
-                return true;
-            }
-
-            if (entityData.Name == "wire") {
-                Wire wire = new Wire(entityData, offset);
-                if (entityData.Has("color"))
-                    wire.Color = entityData.HexColor("color");
-                level.Add(wire);
-                return true;
-            }
-
-            if (!_LoadStrings.Contains(entityData.Name)) {
-                Logger.Log(LogLevel.Warn, "LoadLevel", $"Failed loading entity {entityData.Name}. Room: {entityData.Level.Name} Position: {entityData.Position}");
-            }
-
-            return false;
+            
+            _currentEntityData = prevStoredData;
+            return loaded != null;
         }
 
         private static object _GCCollectLock = Tuple.Create(new object(), "Level Transition GC.Collect");
@@ -487,7 +634,7 @@ namespace Celeste {
         }
 
         private void FixChaserStatesTimeStamp() {
-            if (unpauseTimer > 0f && Tracker.GetEntity<Player>()?.ChaserStates is { } chaserStates) {
+            if (Session.Area.GetLevelSet() != "Celeste" && unpauseTimer > 0f && Tracker.GetEntity<Player>()?.ChaserStates is { } chaserStates) {
                 float offset = Engine.DeltaTime;
 
                 // add one more frame at the end
@@ -502,22 +649,35 @@ namespace Celeste {
             }
         }
 
-        private void CheckForErrors() {
-            if (patch_LevelEnter.ErrorMessage != null) {
+        private bool CheckForErrors() {
+            bool errorPresent = patch_LevelEnter.ErrorMessage != null;
+            if (errorPresent) {
                 LevelEnter.Go(Session, false);
             }
+
+            return errorPresent;
         }
+
+        private bool _IsInDoNotLoadIncreased(LevelData level, EntityData entity) => Session.DoNotLoad.Contains(new EntityID(level.Name, entity.ID + 20000000));
+
+        [ThreadStatic]
+        internal static bool _isLoadingTriggers;
+        
+        [ThreadStatic]
+        internal static EntityData _currentEntityData;
+
+        [ThreadStatic]
+        internal static EntityID _currentEntityId;
     }
 
     public static class LevelExt {
 
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
-
         internal static EventInstance PauseSnapshot => patch_Level._PauseSnapshot;
 
+        [Obsolete("Use Level.SubHudRenderer instead.")]
         public static SubHudRenderer GetSubHudRenderer(this Level self)
             => ((patch_Level) self).SubHudRenderer;
+        [Obsolete("Use Level.SubHudRenderer instead.")]
         public static void SetSubHudRenderer(this Level self, SubHudRenderer value)
             => ((patch_Level) self).SubHudRenderer = value;
 
@@ -532,7 +692,7 @@ namespace MonoMod {
     class PatchLevelLoaderAttribute : Attribute { }
 
     /// <summary>
-    /// Patch leevel loading method to copy decal rotations from <see cref="Celeste.DecalData" /> instances into newly created <see cref="Celeste.Decal" /> entities.
+    /// Patch level loading method to copy decal rotation, color, and depth from <see cref="Celeste.DecalData" /> instances into newly created <see cref="Celeste.Decal" /> entities.
     /// </summary>
     [MonoModCustomMethodAttribute(nameof(MonoModRules.PatchLevelLoaderDecalCreation))]
     class PatchLevelLoaderDecalCreationAttribute : Attribute { }
@@ -567,7 +727,7 @@ namespace MonoMod {
             FieldReference f_Session = context.Method.DeclaringType.FindField("Session");
             FieldReference f_Session_RestartedFromGolden = f_Session.FieldType.Resolve().FindField("RestartedFromGolden");
             MethodDefinition m_cctor = context.Method.DeclaringType.FindMethod(".cctor");
-            MethodDefinition m_LoadNewPlayer = context.Method.DeclaringType.FindMethod("Celeste.Player LoadNewPlayer(Microsoft.Xna.Framework.Vector2,Celeste.PlayerSpriteMode)");
+            MethodDefinition m_LoadNewPlayer = context.Method.DeclaringType.FindMethod("Celeste.Player LoadNewPlayerForLevel(Microsoft.Xna.Framework.Vector2,Celeste.PlayerSpriteMode,Celeste.Level)");
             MethodDefinition m_LoadCustomEntity = context.Method.DeclaringType.FindMethod("System.Boolean LoadCustomEntity(Celeste.EntityData,Celeste.Level)");
             MethodDefinition m_PatchHeartGemBehavior = context.Method.DeclaringType.FindMethod("Celeste.AreaMode _PatchHeartGemBehavior(Celeste.AreaMode)");
 
@@ -579,6 +739,11 @@ namespace MonoMod {
             m_LoadStrings_Add.DeclaringType = t_LoadStrings;
             m_LoadStrings_ctor.DeclaringType = t_LoadStrings;
 
+            FieldReference f_isLoadingTriggers = context.Method.DeclaringType.FindField("_isLoadingTriggers")!;
+            FieldReference f_currentEntityData = context.Method.DeclaringType.FindField("_currentEntityData")!;
+            FieldReference f_currentEntityId = context.Method.DeclaringType.FindField("_currentEntityId")!;
+            MethodReference m_IsInDoNotLoadIncreased = context.Method.DeclaringType.FindMethod("_IsInDoNotLoadIncreased")!;
+
             ILCursor cursor = new ILCursor(context);
 
             // Insert our custom entity loader and use it for levelData.Entities and levelData.Triggers
@@ -586,11 +751,27 @@ namespace MonoMod {
             //  After:  string name = (!Level.LoadCustomEntity(entityData2, this)) ? entityData2.Name : "";
             int nameLoc = -1;
             for (int i = 0; i < 2; i++) {
+                int idLoc = -1;
+
+                // Store the local used for the entityId for later use
+                cursor.GotoNext(
+                    instr => instr.MatchLdloc(out idLoc),
+                    instr => instr.OpCode == OpCodes.Callvirt && (instr.Operand as MethodReference).GetID()
+                        .Contains("HashSet`1<Celeste.EntityID>::Contains"));
+                
                 cursor.GotoNext(
                     instr => instr.MatchLdfld("Celeste.EntityData", "Name"), // cursor.Next (get entity name)
                     instr => instr.MatchStloc(out nameLoc), // cursor.Next.Next (save entity name)
                     instr => instr.MatchLdloc(out _),
                     instr => instr.MatchCall("<PrivateImplementationDetails>", "System.UInt32 ComputeStringHash(System.String)"));
+                
+                // + _currentEntityData = entityData;
+                // + _currentEntityId = entityId;
+                cursor.Emit(OpCodes.Dup);
+                cursor.EmitStsfld(f_currentEntityData);
+                cursor.EmitLdloc(idLoc);
+                cursor.EmitStsfld(f_currentEntityId);
+                
                 cursor.Emit(OpCodes.Dup);
                 cursor.Emit(OpCodes.Ldarg_0);
                 cursor.Emit(OpCodes.Call, m_LoadCustomEntity);
@@ -599,6 +780,59 @@ namespace MonoMod {
                 cursor.Emit(OpCodes.Ldstr, "");
                 cursor.Emit(OpCodes.Br_S, cursor.Next.Next); // True -> custom entity loaded, so skip the vanilla handler by saving "" as the entity name
                 cursor.Index++;
+
+                if (i == 0) {
+                    // Go to trigger processing next iteration
+                    cursor.GotoNext(MoveType.After, instr => instr.MatchLdfld("Celeste.LevelData", "Triggers"));
+                }
+            }
+
+            // Reset to apply trigger loading patches
+            cursor.Index = 0;
+            
+            // + _currentEntityData = null;
+            //   Celeste.ClutterBlockGenerator.Generate();
+            cursor.GotoNext(MoveType.AfterLabel, instr => instr.MatchCallOrCallvirt("Celeste.ClutterBlockGenerator", "Generate"));
+            Instruction oldFinallyEnd = cursor.Next;
+            cursor.Emit(OpCodes.Ldnull);
+            Instruction newFinallyEnd = cursor.Prev;
+            cursor.EmitStsfld(f_currentEntityData);
+            foreach (ExceptionHandler handler in context.Body.ExceptionHandlers.Where(handler => handler.HandlerEnd == oldFinallyEnd)) {
+                handler.HandlerEnd = newFinallyEnd;
+                break;
+            }
+            
+            int v_levelData = -1;
+            cursor.GotoNext(MoveType.Before, instr => instr.MatchLdloc(out v_levelData), instr => instr.MatchLdfld("Celeste.LevelData", "Triggers"));
+            // set global flag _isLoadingTriggers to true
+            cursor.EmitLdcI4(1);
+            cursor.EmitStsfld(f_isLoadingTriggers);
+            int v_entityData = -1;
+            cursor.GotoNext(instr => instr.MatchLdloc(out v_entityData), instr => instr.MatchLdfld("Celeste.EntityData", "ID"));
+            ILLabel continueLabel = null;
+            cursor.GotoNext(MoveType.After, instr => instr.MatchBrtrue(out continueLabel));
+            // add
+            // || _IsInDoNotLoadIncreased(levelData, trigger)
+            // to if condition for continue to handle triggers that already add 10000000 to their DoNotLoad entry
+            cursor.EmitLdarg0();
+            cursor.EmitLdloc(v_levelData);
+            cursor.EmitLdloc(v_entityData);
+            cursor.EmitCall(m_IsInDoNotLoadIncreased);
+            cursor.EmitBrtrue(continueLabel);
+            cursor.GotoNext(MoveType.AfterLabel, instr => instr.MatchLdloc(out _), instr => instr.MatchLdfld("Celeste.LevelData", "FgDecals"));
+            oldFinallyEnd = cursor.Next;
+            
+            // Clear _currentEntityData
+            cursor.Emit(OpCodes.Ldnull);
+            newFinallyEnd = cursor.Prev;
+            cursor.EmitStsfld(f_currentEntityData);
+            // set _isLoadingTriggers to false
+            cursor.EmitLdcI4(0);
+            cursor.EmitStsfld(f_isLoadingTriggers);
+            // fix end of finally block
+            foreach (ExceptionHandler handler in context.Body.ExceptionHandlers.Where(handler => handler.HandlerEnd == oldFinallyEnd)) {
+                handler.HandlerEnd = newFinallyEnd;
+                break;
             }
 
             // Reset to apply entity patches
@@ -628,8 +862,9 @@ namespace MonoMod {
 
             // Patch Player creation so we avoid ever loading more than one at the same time
             //  Before: Player player = new Player(this.Session.RespawnPoint.Value, spriteMode);
-            //  After:  Player player = Level.LoadNewPlayer(this.Session.RespawnPoint.Value, spriteMode);
+            //  After:  Player player = Level.LoadNewPlayerForLevel(this.Session.RespawnPoint.Value, spriteMode, this);
             cursor.GotoNext(instr => instr.MatchNewobj("Celeste.Player"));
+            cursor.Emit(OpCodes.Ldarg_0);
             cursor.Next.OpCode = OpCodes.Call;
             cursor.Next.Operand = m_LoadNewPlayer;
 
@@ -661,8 +896,17 @@ namespace MonoMod {
         public static void PatchLevelLoaderDecalCreation(ILContext context, CustomAttribute attrib) {
             TypeDefinition t_DecalData = MonoModRule.Modder.FindType("Celeste.DecalData").Resolve();
             TypeDefinition t_Decal = MonoModRule.Modder.FindType("Celeste.Decal").Resolve();
+
             FieldDefinition f_DecalData_Rotation = t_DecalData.FindField("Rotation");
-            MethodDefinition m_Decal_ctor = t_Decal.FindMethod("System.Void .ctor(System.String,Microsoft.Xna.Framework.Vector2,Microsoft.Xna.Framework.Vector2,System.Int32,System.Single)");
+            FieldDefinition f_DecalData_ColorHex = t_DecalData.FindField("ColorHex");
+            FieldDefinition f_DecalData_Depth    = t_DecalData.FindField("Depth");
+
+            FieldDefinition f_Decal_DepthSetByPlacement = t_Decal.FindField("DepthSetByPlacement");
+
+            MethodDefinition m_DecalData_HasDepth = t_DecalData.FindMethod("HasDepth");
+            MethodDefinition m_DecalData_GetDepth = t_DecalData.FindMethod("GetDepth");
+
+            MethodDefinition m_Decal_ctor = t_Decal.FindMethod("System.Void .ctor(System.String,Microsoft.Xna.Framework.Vector2,Microsoft.Xna.Framework.Vector2,System.Int32,System.Single,System.String)");
 
             ILCursor cursor = new ILCursor(context);
 
@@ -674,15 +918,32 @@ namespace MonoMod {
                                       instr => instr.MatchLdfld("Celeste.DecalData", "Scale"),
                                       instr => instr.MatchLdcI4(Celeste.Depths.FGDecals)
                                             || instr.MatchLdcI4(Celeste.Depths.BGDecals))) {
-                // we are trying to get:
-                //   decal = new Decal()
+                // load the depth from the DecalData, with the Celeste.Depths.??Decals value as a default
+                cursor.Index--;
+                cursor.Emit(OpCodes.Ldloc_S, (byte) loc_decaldata);
+                cursor.Index++;
+                cursor.Emit(OpCodes.Call, m_DecalData_GetDepth);
 
-                // load the rotation from the DecalData
+                // load the rotation and color from the DecalData
                 cursor.Emit(OpCodes.Ldloc_S, (byte) loc_decaldata);
                 cursor.Emit(OpCodes.Ldfld, f_DecalData_Rotation);
+                cursor.Emit(OpCodes.Ldloc_S, (byte) loc_decaldata);
+                cursor.Emit(OpCodes.Ldfld, f_DecalData_ColorHex);
+
                 // and replace the Decal constructor to accept it
                 cursor.Emit(OpCodes.Newobj, m_Decal_ctor);
                 cursor.Remove();
+
+                // if the depth was set in the DecalData...
+                ILLabel after_set = cursor.DefineLabel();
+                cursor.Emit(OpCodes.Ldloc_S, (byte) loc_decaldata);
+                cursor.Emit(OpCodes.Call, m_DecalData_HasDepth);
+                cursor.Emit(OpCodes.Brfalse_S, after_set);
+                // store that information in the Decal
+                cursor.Emit(OpCodes.Dup);
+                cursor.Emit(OpCodes.Ldc_I4_1);
+                cursor.Emit(OpCodes.Stfld, f_Decal_DepthSetByPlacement);
+                cursor.MarkLabel(after_set);
 
                 matches++;
             }
@@ -702,8 +963,13 @@ namespace MonoMod {
 
             // Insert CheckForErrors() at the beginning so we can display an error screen if needed
             cursor.Emit(OpCodes.Ldarg_0).Emit(OpCodes.Call, m_CheckForErrors);
+            // Insert an if statement that returns if we find an error at CheckForErrors
+            ILLabel rest = cursor.DefineLabel();
+            cursor.Emit(OpCodes.Brfalse, rest).Emit(OpCodes.Ret);
 
             // insert FixChaserStatesTimeStamp()
+            cursor.MarkLabel(rest);
+            cursor.MoveAfterLabels();
             cursor.Emit(OpCodes.Ldarg_0).Emit(OpCodes.Call, m_FixChaserStatesTimeStamp);
 
             /* We expect something similar enough to the following:

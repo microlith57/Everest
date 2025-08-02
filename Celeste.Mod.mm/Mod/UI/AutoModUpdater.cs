@@ -44,7 +44,7 @@ namespace Celeste.Mod.UI {
             // add on-screen elements like GameLoader/OverworldLoader
             Add(new HudRenderer());
             Add(snow);
-            RendererList.UpdateLists();
+            ((patch_RendererList) (object) RendererList).UpdateLists();
 
             // register the routine
             Entity entity = new Entity();
@@ -111,7 +111,7 @@ namespace Celeste.Mod.UI {
                     // download it...
                     modUpdatingMessage = $"{progressString} {Dialog.Clean("AUTOUPDATECHECKER_DOWNLOADING")}";
 
-                    Logger.Log(LogLevel.Verbose, "AutoModUpdater", $"Downloading {update.URL} to {zipPath}");
+                    Logger.Verbose("AutoModUpdater", $"Downloading {update.URL} to {zipPath}");
                     Func<int, long, int, bool> progressCallback = (position, length, speed) => {
                         if (skipUpdate) {
                             return false;
@@ -127,19 +127,39 @@ namespace Celeste.Mod.UI {
                         return true;
                     };
 
-                    try {
-                        Everest.Updater.DownloadFileWithProgress(update.URL, zipPath, progressCallback);
-                    } catch (WebException e) {
-                        Logger.Log(LogLevel.Warn, "AutoModUpdater", $"Download failed, trying mirror {update.MirrorURL}");
-                        Logger.LogDetailed(e);
-                        Everest.Updater.DownloadFileWithProgress(update.MirrorURL, zipPath, progressCallback);
+                    Exception downloadException = null;
+
+                    foreach (string url in ModUpdaterHelper.GetAllMirrorUrls(update.URL)) {
+                        try {
+                            downloadException = null;
+
+                            Logger.Warn("AutoModUpdater", $"Downloading from {url}");
+                            Everest.Updater.DownloadFileWithProgress(url, zipPath, progressCallback);
+                            if (skipUpdate) break;
+
+                            // verify checksum
+                            modUpdatingMessage = $"{progressString} {Dialog.Clean("AUTOUPDATECHECKER_VERIFYING")}";
+                            ModUpdaterHelper.VerifyChecksum(update, zipPath);
+
+                            break; // out of the loop
+                        } catch (Exception e) when (e is WebException or TimeoutException or IOException) {
+                            downloadException = e;
+                            Logger.Warn("AutoModUpdater", $"Download from {url} failed, trying another mirror");
+                            Logger.LogDetailed(e);
+                            continue; // to the next mirror
+                        }
+                    }
+
+                    if (downloadException != null) {
+                        ModUpdaterHelper.TryDelete(zipPath);
+                        throw downloadException;
                     }
 
                     // hide the cancel button for downloading, download is done
                     showCancel = false;
 
                     if (skipUpdate) {
-                        Logger.Log(LogLevel.Verbose, "AutoModUpdater", "Update was skipped");
+                        Logger.Verbose("AutoModUpdater", "Update was skipped");
 
                         // try to delete mod-update.zip if it still exists.
                         ModUpdaterHelper.TryDelete(zipPath);
@@ -154,10 +174,6 @@ namespace Celeste.Mod.UI {
                         }
                     }
 
-                    // verify its checksum
-                    modUpdatingMessage = $"{progressString} {Dialog.Clean("AUTOUPDATECHECKER_VERIFYING")}";
-                    ModUpdaterHelper.VerifyChecksum(update, zipPath);
-
                     // install it
                     restartRequired = true;
                     modUpdatingMessage = $"{progressString} {Dialog.Clean("AUTOUPDATECHECKER_INSTALLING")}";
@@ -165,7 +181,7 @@ namespace Celeste.Mod.UI {
 
                 } catch (Exception e) {
                     // update failed
-                    Logger.Log(LogLevel.Warn, "AutoModUpdater", $"Updating {update.Name} failed");
+                    Logger.Warn("AutoModUpdater", $"Updating {update.Name} failed");
                     Logger.LogDetailed(e);
                     failuresOccured = true;
 
@@ -250,9 +266,9 @@ namespace Celeste.Mod.UI {
 
                 // render a 2 pixel-thick cogwheel shadow / outline
                 for (int x = -2; x <= 2; x++)
-                    for (int y = -2; y <= 2; y++)
-                        if (x != 0 || y != 0)
-                            cogwheel.DrawCentered(cogPosition + new Vector2(x, y), Color.Black, cogScale, cogRot);
+                for (int y = -2; y <= 2; y++)
+                    if (x != 0 || y != 0)
+                        cogwheel.DrawCentered(cogPosition + new Vector2(x, y), Color.Black, cogScale, cogRot);
 
                 // render the cogwheel itself
                 cogwheel.DrawCentered(cogPosition, Color.White, cogScale, cogRot);

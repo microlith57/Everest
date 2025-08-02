@@ -4,6 +4,9 @@ using Monocle;
 using MonoMod;
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
+using System.Linq;
+using System.Runtime.InteropServices;
 using YamlDotNet.Serialization;
 
 namespace Celeste.Mod.Core {
@@ -77,7 +80,7 @@ namespace Celeste.Mod.Core {
                         Engine.Commands.Enabled = false;
                 }
 
-                ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.RebuildMainAndTitle();
+                ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.NeedsRebuild();
             }
         }
 
@@ -140,6 +143,7 @@ namespace Celeste.Mod.Core {
 
         [SettingIgnore]
         public bool LazyLoading_Yes_I_Know_This_Can_Cause_Bugs { get; set; } = false;
+
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
         [SettingIgnore] // TODO: Show as advanced setting.
@@ -160,10 +164,18 @@ namespace Celeste.Mod.Core {
         [SettingIgnore] // TODO: Show as advanced setting.
         public bool? ThreadedGL { get; set; } = null;
 
+        [YamlMember(Alias = "FastTextureLoading")]
+        [SettingIgnore]
+        public bool? _FastTextureLoading { get; set; } = null;
+
+        [YamlIgnore]
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
         [SettingIgnore] // TODO: Show as advanced setting.
-        public bool? FastTextureLoading { get; set; } = null;
+        public bool? FastTextureLoading {
+            get => Everest.Content.DumpOnLoad || Everest.Content._DumpAll ? false : _FastTextureLoading;
+            set => _FastTextureLoading = value;
+        }
 
         [SettingNeedsRelaunch]
         [SettingInGame(false)]
@@ -225,10 +237,18 @@ namespace Celeste.Mod.Core {
                 _MainMenuMode = value;
                 if (value != originalValue) {
                     // the main menu mode was changed; rebuild the main menu
-                    ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.RebuildMainAndTitle();
+                    ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.NeedsRebuild();
                 }
             }
         }
+
+        public Everest.CompatMode CompatibilityMode { get; set; } = Everest.CompatMode.None; // TODO Better default logic
+
+        [SettingNeedsRelaunch]
+        [SettingName("MODOPTIONS_COREMODULE_D3D11EXCLUSIVEFULLSCREEN")]
+        [SettingSubText("MODOPTIONS_COREMODULE_D3D11EXCLUSIVEFULLSCREEN_DESC")]
+        [SettingInGame(false)]
+        public bool D3D11UseExclusiveFullscreen { get; set; }
 
         [SettingInGame(false)]
         public bool UseKeyboardForTextInput { get; set; } = true;
@@ -246,27 +266,118 @@ namespace Celeste.Mod.Core {
                 _WarnOnEverestYamlErrors = value;
 
                 // rebuild the main menu to make sure we show/hide the yaml error notice.
-                ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.RebuildMainAndTitle();
+                ((patch_OuiMainMenu) (Engine.Scene as Overworld)?.GetUI<OuiMainMenu>())?.NeedsRebuild();
             }
         }
+
+        private bool _ColorizedLogging = true;
+        [SettingSubText("MODOPTIONS_COREMODULE_COLORIZEDLOGGING_DESC")]
+        [SettingInGame(false)]
+        public bool ColorizedLogging {
+            get => _ColorizedLogging;
+            set {
+                if (value && RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && !Logger.TryEnableWindowsVTSupport()) {
+                    Logger.Error("core", "Failed to enable Windows VT support!");
+                }
+                _ColorizedLogging = value;
+            }
+        }
+
+        // Keep in sync with https://github.com/EverestAPI/Olympus/blob/main/src/scenes/options.lua :: mirrorPreferences
+        public string MirrorPreferences { get; set; } = "gb,jade,otobot,wegfan";
 
         public bool DiscordRichPresence { get; set; } = true;
 
         [SettingIgnore]
         public bool DiscordShowIcon { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowMap { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowSide { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowRoom { get; set; } = false;
+
         [SettingIgnore]
         public bool DiscordShowBerries { get; set; } = true;
+
         [SettingIgnore]
         public bool DiscordShowDeaths { get; set; } = true;
 
         [SettingIgnore]
         public int DebugRCPort { get; set; } = 32270;
+
+        public bool PhotosensitiveMode {
+            get => Settings.Instance.DisableFlashes;
+            set => Settings.Instance.DisableFlashes = value;
+        }
+        
+        [SettingIgnore]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        // This option is exclusively used internally; do not use it in mods. Use AllowDistort instead.
+        // It needs to be public for YamlDotNet to not have an aneurysm, but it really shouldn't be.
+        public bool PhotosensitivityDistortOverride { get; set; } = false;
+
+        /// <summary>
+        /// Whether a distortion effect should be rendered, respecting Everest's photosensitivity setting overrides.
+        /// </summary>
+        [SettingIgnore]
+        [YamlIgnore]
+        public bool AllowDistort => !Settings.Instance.DisableFlashes || PhotosensitivityDistortOverride; 
+
+        [SettingIgnore]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        // This option is exclusively used internally; do not use it in mods. Use AllowGlitch instead.
+        // It needs to be public for YamlDotNet to not have an aneurysm, but it really shouldn't be.
+        public bool PhotosensitivityGlitchOverride { get; set; } = false;
+
+        /// <summary>
+        /// Whether a glitch effect should be rendered, respecting Everest's photosensitivity setting overrides.
+        /// </summary>
+        [SettingIgnore]
+        [YamlIgnore]
+        public bool AllowGlitch => !Settings.Instance.DisableFlashes || PhotosensitivityGlitchOverride;
+
+        [SettingIgnore]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        // This option is exclusively used internally; do not use it in mods. Use AllowLightning instead.
+        // It needs to be public for YamlDotNet to not have an aneurysm, but it really shouldn't be.
+        public bool PhotosensitivityLightningOverride { get; set; } = false;
+
+        /// <summary>
+        /// Whether lightning should have internal flashes, respecting Everest's photosensitivity setting overrides.
+        /// </summary>
+        [SettingIgnore]
+        [YamlIgnore]
+        public bool AllowLightning => !Settings.Instance.DisableFlashes || PhotosensitivityLightningOverride;
+
+        [SettingIgnore]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        // This option is exclusively used internally; do not use it in mods. Use AllowScreenFlash instead.
+        // It needs to be public for YamlDotNet to not have an aneurysm, but it really shouldn't be.
+        public bool PhotosensitivityScreenFlashOverride { get; set; } = false;
+
+        /// <summary>
+        /// Whether to render a screenwide flash, respecting Everest's photosensitivity setting overrides.
+        /// </summary>
+        [SettingIgnore]
+        [YamlIgnore]
+        public bool AllowScreenFlash => !Settings.Instance.DisableFlashes || PhotosensitivityScreenFlashOverride; 
+
+        [SettingIgnore]
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        // This option is exclusively used internally; do not use it in mods. Use AllowTextHighlight instead.
+        // It needs to be public for YamlDotNet to not have an aneurysm, but it really shouldn't be.
+        public bool PhotosensitivityTextHighlightOverride { get; set; } = false;
+
+        /// <summary>
+        /// Whether text in menus should flash when selected, respecting Everest's photosensitivity setting overrides.
+        /// </summary>
+        [SettingIgnore]
+        [YamlIgnore]
+        public bool AllowTextHighlight => !Settings.Instance.DisableFlashes || PhotosensitivityTextHighlightOverride;
 
         [SettingIgnore]
         public int? QuickRestart { get; set; }
@@ -286,13 +397,29 @@ namespace Celeste.Mod.Core {
         }
 
         [SettingIgnore]
+        public bool UseInGameCrashHandler { get; set; } = true;
+
+        [SettingIgnore]
+        public bool CrashHandlerAlwaysTeabag { get; set; } = false; // The world is a cruel place, so we can't turn this on by default... ._.
+
+        [SettingIgnore]
         public string CurrentVersion { get; set; }
 
-        [SettingIgnore]
-        public string CurrentBranch { get; set; }
+        private string _CurrentBranch;
 
         [SettingIgnore]
-        public Dictionary<string, LogLevel> LogLevels { get; set; } = new Dictionary<string, LogLevel>();
+        public string CurrentBranch {
+            get => _CurrentBranch;
+            set => _CurrentBranch = value is "dev" or "beta" or "stable" ? "updater_src_" + value : value; // branch names were changed at some point
+        }
+
+        private Dictionary<string, LogLevel> _LogLevels = new Dictionary<string, LogLevel>();
+
+        [SettingIgnore]
+        public Dictionary<string, LogLevel> LogLevels {
+            get => _LogLevels;
+            set => _LogLevels = value ?? new Dictionary<string, LogLevel>();
+        }
 
         [SettingSubHeader("MODOPTIONS_COREMODULE_MENUNAV_SUBHEADER")]
         [SettingInGame(false)]
@@ -303,6 +430,10 @@ namespace Celeste.Mod.Core {
 
         [SettingSubHeader("MODOPTIONS_COREMODULE_DEBUGMODE_SUBHEADER")]
         [SettingInGame(false)]
+        [DefaultButtonBinding(0, Keys.OemTilde)]
+        public ButtonBinding ToggleDebugConsole { get; set; }
+
+        [SettingInGame(false)]
         [DefaultButtonBinding(0, Keys.OemPeriod)]
         public ButtonBinding DebugConsole { get; set; }
 
@@ -312,19 +443,19 @@ namespace Celeste.Mod.Core {
 
         [SettingSubHeader("MODOPTIONS_COREMODULE_MOUNTAINCAM_SUBHEADER")]
         [SettingInGame(false)]
-        [DefaultButtonBinding(0, Keys.W)]
+        [DefaultButtonBinding(Buttons.RightThumbstickUp, Keys.W)]
         public ButtonBinding CameraForward { get; set; }
 
         [SettingInGame(false)]
-        [DefaultButtonBinding(0, Keys.S)]
+        [DefaultButtonBinding(Buttons.RightThumbstickDown, Keys.S)]
         public ButtonBinding CameraBackward { get; set; }
 
         [SettingInGame(false)]
-        [DefaultButtonBinding(0, Keys.D)]
+        [DefaultButtonBinding(Buttons.RightThumbstickRight, Keys.D)]
         public ButtonBinding CameraRight { get; set; }
 
         [SettingInGame(false)]
-        [DefaultButtonBinding(0, Keys.A)]
+        [DefaultButtonBinding(Buttons.RightThumbstickLeft, Keys.A)]
         public ButtonBinding CameraLeft { get; set; }
 
         [SettingInGame(false)]
@@ -365,7 +496,7 @@ namespace Celeste.Mod.Core {
             List<string> inputGuiPrefixes = new List<string> {
                 "" // Auto
             };
-            foreach (KeyValuePair<string, MTexture> kvp in GFX.Gui.GetTextures()) {
+            foreach (KeyValuePair<string, MTexture> kvp in ((patch_Atlas) GFX.Gui).Textures) {
                 string path = kvp.Key;
                 if (!path.StartsWith("controls/"))
                     continue;
@@ -410,6 +541,55 @@ namespace Celeste.Mod.Core {
                     })
                 );
             }
+        }
+
+        public void CreateCompatibilityModeEntry(TextMenu menu, bool inGame) {
+            if (inGame)
+                return;
+
+            TextMenu.Slider compatSlider = new TextMenu.Slider(Dialog.Clean("modoptions_coremodule_compatmode"),
+                i => Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) i)}"),
+                0, Enum.GetValues<Everest.CompatMode>().Length - 1, (int) CompatibilityMode
+            );
+            compatSlider.OnValueChange += val => CompatibilityMode = (Everest.CompatMode) val;
+            menu.Add(compatSlider);
+            compatSlider.NeedsRelaunch((patch_TextMenu) menu);
+
+            // We need to build our own description text as it is not static
+            TextMenuExt.EaseInSubHeaderExt descrTextA = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName(CompatibilityMode)}_descr_a"), false, menu) {
+                TextColor = Color.Gray,
+                HeightExtra = 0f
+            };
+            TextMenuExt.EaseInSubHeaderExt descrTextB = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName(CompatibilityMode)}_descr_b"), false, menu) {
+                TextColor = Color.DarkOrange,
+                HeightExtra = 0f
+            };
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(compatSlider) + 1, descrTextA);
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(compatSlider) + 2, descrTextB);
+
+            compatSlider.OnEnter += () => descrTextA.FadeVisible = descrTextB.FadeVisible = true;
+            compatSlider.OnLeave += () => descrTextA.FadeVisible = descrTextB.FadeVisible = false;
+            compatSlider.OnValueChange += val => {
+                descrTextA.Title = Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) val)}_descr_a");
+                descrTextB.Title = Dialog.Clean($"modoptions_coremodule_compatmode_{Enum.GetName((Everest.CompatMode) val)}_descr_b");
+                menu.RecalculateSize();
+            };
+
+            // Show a warning if it is incompatible with the vanilla framework
+            TextMenuExt.EaseInSubHeaderExt warningText = new TextMenuExt.EaseInSubHeaderExt(Dialog.Clean($"modoptions_coremodule_compatmode_incompatible"), false, menu) {
+                TextColor = Color.OrangeRed,
+                HeightExtra = 0f
+            };
+            ((patch_TextMenu) menu).Insert(((patch_TextMenu) menu).Items.IndexOf(descrTextB) + 1, warningText);
+
+            static bool IsCompatible(Everest.CompatMode mode) =>
+                (Everest.Flags.VanillaIsFNA && mode == Everest.CompatMode.LegacyXNA) ||
+                (Everest.Flags.VanillaIsXNA && mode == Everest.CompatMode.LegacyFNA)
+            ;
+
+            compatSlider.OnEnter += () => warningText.FadeVisible = IsCompatible(CompatibilityMode);
+            compatSlider.OnLeave += () => warningText.FadeVisible = false;
+            compatSlider.OnValueChange += val => warningText.FadeVisible = IsCompatible((Everest.CompatMode) val);
         }
 
         public void CreateDiscordRichPresenceEntry(TextMenu menu, bool inGame) {
@@ -477,7 +657,7 @@ namespace Celeste.Mod.Core {
             TextMenu.Item masterSwitch = new TextMenu.OnOff(Dialog.Clean("modoptions_coremodule_discordrichpresence"), DiscordRichPresence)
                 .Change(value => {
                     DiscordRichPresence = value;
-                    if (DiscordRichPresence) {
+                    if (DiscordRichPresence && !Everest.Flags.IsHeadless) {
                         Everest.DiscordSDK.CreateInstance()?.UpdatePresence(session);
                     } else {
                         Everest.DiscordSDK.Instance?.Dispose();
@@ -501,6 +681,78 @@ namespace Celeste.Mod.Core {
             showRoom.Disabled = !DiscordShowMap;
 
             menu.Add(submenu);
+        }
+
+
+        // If we want to put the advanced photosensitivity settings in Mod Options, just uncomment this.
+        // Left in (albeit commented) in case the implementation changes.
+        /*
+        public void CreatePhotosensitiveModeEntry(TextMenu menu, bool inGame) {
+
+            TextMenu.Item distort = new TextMenu.OnOff(Dialog.Clean("MODOPTIONS_COREMODULE_PSDISTORT"), PhotosensitivityDistortOverride)
+                .Change(value => {
+                    PhotosensitivityDistortOverride = value;
+                });
+
+            TextMenu.Item glitch = new TextMenu.OnOff(Dialog.Clean("MODOPTIONS_COREMODULE_PSGLITCH"), PhotosensitivityGlitchOverride)
+                .Change(value => {
+                    PhotosensitivityGlitchOverride = value;
+                });
+
+            TextMenu.Item lightning = new TextMenu.OnOff(Dialog.Clean("MODOPTIONS_COREMODULE_PSLIGHTNING"), PhotosensitivityLightningOverride)
+                .Change(value => {
+                    PhotosensitivityLightningOverride = value;
+                });
+
+            TextMenu.Item screenFlash = new TextMenu.OnOff(Dialog.Clean("MODOPTIONS_COREMODULE_PSSCREENFLASH"), PhotosensitivityScreenFlashOverride)
+                .Change(value => {
+                    PhotosensitivityScreenFlashOverride = value;
+                });
+
+            TextMenu.Item textHighlight = new TextMenu.OnOff(Dialog.Clean("MODOPTIONS_COREMODULE_PSTEXTHIGHLIGHT"), PhotosensitivityTextHighlightOverride)
+                .Change(value => {
+                    PhotosensitivityTextHighlightOverride = value;
+                });
+
+            TextMenuExt.SubMenu submenu = new TextMenuExt.SubMenu(Dialog.Clean("MODOPTIONS_COREMODULE_PSOPTIONS"), false)
+                .Add(distort)
+                .Add(glitch)
+                .Add(lightning)
+                .Add(screenFlash)
+                .Add(textHighlight);
+
+            TextMenu.Item masterSwitch = new TextMenu.OnOff(Dialog.Clean("OPTIONS_DISABLE_FLASH"), PhotosensitiveMode)
+                .Change(value => {
+                    PhotosensitiveMode = value;
+                    submenu.Disabled = !value;
+                });
+
+            menu.Add(masterSwitch);
+            menu.Add(submenu);
+        } */
+
+        public void CreateMirrorPreferencesEntry(TextMenu menu, bool inGame) {
+            if (inGame) return;
+
+            List<string> mirrorPreferences = new List<string> {
+                "gb,jade,otobot,wegfan",
+                "jade,otobot,wegfan,gb",
+                "wegfan,otobot,jade,gb",
+                "otobot,jade,wegfan,gb"
+            };
+            List<string> dialogKeys = mirrorPreferences
+                .Select(setting => "MODOPTIONS_COREMODULE_MIRRORPREFERENCES_" + setting.Substring(0, setting.IndexOf(",")))
+                .ToList();
+
+            menu.Add(
+                new TextMenu.Slider(
+                    label: Dialog.Clean("MODOPTIONS_COREMODULE_MIRRORPREFERENCES"),
+                    values: index => Dialog.Clean(dialogKeys[index]),
+                    min: 0,
+                    max: mirrorPreferences.Count - 1,
+                    value: mirrorPreferences.IndexOf(MirrorPreferences)
+                ).Change(value => MirrorPreferences = mirrorPreferences[value])
+            );
         }
 
         public enum VanillaTristate {

@@ -58,12 +58,19 @@ namespace Celeste.Mod.UI {
             Everest.Updater.Entry everestVersionToInstall = null;
 
             Dictionary<string, ModUpdateInfo> availableDownloads = ModUpdaterHelper.DownloadModUpdateList();
+
             if (availableDownloads == null) {
                 shouldAutoExit = false;
                 shouldRestart = false;
 
                 LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_DOWNLOAD_DATABASE_FAILED"));
             } else {
+                // add transitive dependencies to the list of dependencies to download, by using the mod dependency graph.
+                Dictionary<string, EverestModuleMetadata> modDependencyGraph = ModUpdaterHelper.DownloadModDependencyGraph();
+                if (modDependencyGraph != null) {
+                    addTransitiveDependencies(modDependencyGraph);
+                }
+
                 // load information on all installed mods, so that we can spot blacklisted ones easily.
                 LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_LOADING_INSTALLED_MODS"));
 
@@ -85,7 +92,7 @@ namespace Celeste.Mod.UI {
                 }
                 Lines[Lines.Count - 1] = $"{Dialog.Clean("DEPENDENCYDOWNLOADER_LOADING_INSTALLED_MODS")} {Dialog.Clean("DEPENDENCYDOWNLOADER_DONE")}";
 
-                Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", "Computing dependencies to download...");
+                Logger.Verbose("OuiDependencyDownloader", "Computing dependencies to download...");
 
                 // these mods are not installed currently, we will install them
                 Dictionary<string, ModUpdateInfo> modsToInstall = new Dictionary<string, ModUpdateInfo>();
@@ -112,10 +119,10 @@ namespace Celeste.Mod.UI {
 
                 foreach (EverestModuleMetadata dependency in MissingDependencies) {
                     if (Everest.Loader.Delayed.Any(delayedMod => dependency.Name == delayedMod.Item1.Name)) {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} is installed but load is delayed, skipping");
+                        Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} is installed but load is delayed, skipping");
 
-                    } else if (dependency.Name == "Everest") {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"Everest should be updated");
+                    } else if (dependency.Name == "Everest" || dependency.Name == Core.CoreModule.NETCoreMetaName) {
+                        Logger.Verbose("OuiDependencyDownloader", $"Everest should be updated");
                         shouldAutoExit = false;
 
                         if (dependency.Version.Major != 1 || dependency.Version.Build > 0 || dependency.Version.Revision > 0) {
@@ -130,20 +137,20 @@ namespace Celeste.Mod.UI {
                             }
                         }
                     } else if (tryUnblacklist(dependency, allModsInformation, modFilenamesToUnblacklist)) {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} is blacklisted, and should be unblacklisted instead");
+                        Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} is blacklisted, and should be unblacklisted instead");
 
                     } else if (!availableDownloads.ContainsKey(dependency.Name)) {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} was not found in the database");
+                        Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} was not found in the database");
                         modsNotFound.Add(dependency.Name);
                         shouldAutoExit = false;
 
                     } else if (availableDownloads[dependency.Name].xxHash.Count > 1) {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} has multiple versions and cannot be installed automatically");
+                        Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} has multiple versions and cannot be installed automatically");
                         modsNotInstallableAutomatically.Add(dependency.Name);
                         shouldAutoExit = false;
 
                     } else if (!isVersionCompatible(dependency.Version, availableDownloads[dependency.Name].Version)) {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} has a version in database ({availableDownloads[dependency.Name].Version}) that would not satisfy dependency ({dependency.Version})");
+                        Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} has a version in database ({availableDownloads[dependency.Name].Version}) that would not satisfy dependency ({dependency.Version})");
 
                         // add the required version to the list of versions for this mod
                         HashSet<Version> requiredVersions = modsWithIncompatibleVersionInDatabase.TryGetValue(dependency.Name, out HashSet<Version> result) ? result : new HashSet<Version>();
@@ -164,12 +171,12 @@ namespace Celeste.Mod.UI {
                         }
 
                         if (installedVersion != null) {
-                            Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} is already installed and will be updated");
+                            Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} is already installed and will be updated");
                             modsToUpdate[dependency.Name] = availableDownloads[dependency.Name];
                             modsToUpdateCurrentVersions[dependency.Name] = installedVersion;
 
                         } else {
-                            Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"{dependency.Name} will be installed");
+                            Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} will be installed");
                             modsToInstall[dependency.Name] = availableDownloads[dependency.Name];
                         }
                     }
@@ -196,19 +203,20 @@ namespace Celeste.Mod.UI {
                             LogLine(string.Format(Dialog.Get("DEPENDENCYDOWNLOADER_MOD_UNBLACKLIST"), modFilename));
 
                             // remove the mod from the loaded blacklist
-                            Everest.Loader._Blacklist.RemoveAll(item => item == modFilename);
+                            Everest.Loader._Blacklist.RemoveWhere(item => item == modFilename);
 
-                            // hot load the mod
-                            if (modFilename.EndsWith(".zip")) {
-                                Everest.Loader.LoadZip(Path.Combine(Everest.Loader.PathMods, modFilename));
-                            } else {
-                                Everest.Loader.LoadDir(Path.Combine(Everest.Loader.PathMods, modFilename));
+                            if (!shouldRestart) { // don't waste time hot loading since we're restarting anyway
+                                // hot load the mod
+                                if (modFilename.EndsWith(".zip")) {
+                                    Everest.Loader.LoadZip(Path.Combine(Everest.Loader.PathMods, modFilename));
+                                } else {
+                                    Everest.Loader.LoadDir(Path.Combine(Everest.Loader.PathMods, modFilename));
+                                }
                             }
                         } catch (Exception e) {
                             // something bad happened during the mod hot loading, log it and prompt to restart the game to load the mod.
                             LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_UNBLACKLIST_FAILED"));
                             Logger.LogDetailed(e);
-                            shouldAutoExit = false;
                             shouldRestart = true;
                             break;
                         }
@@ -268,6 +276,36 @@ namespace Celeste.Mod.UI {
             }
         }
 
+        private static void addTransitiveDependencies(Dictionary<string, EverestModuleMetadata> modDependencyGraph) {
+            List<EverestModuleMetadata> newlyMissing = new List<EverestModuleMetadata>();
+            do {
+                Logger.Verbose("OuiDependencyDownloader", "Checking for transitive dependencies...");
+
+                newlyMissing.Clear();
+
+                // All transitive dependencies must be either loaded or missing. If not, they're added as missing as well.
+                foreach (EverestModuleMetadata metadata in MissingDependencies) {
+                    if (!modDependencyGraph.TryGetValue(metadata.Name, out EverestModuleMetadata graphEntry)) {
+                        Logger.Verbose("OuiDependencyDownloader", $"{metadata.Name} was not found in the graph");
+                    } else {
+                        foreach (EverestModuleMetadata dependency in graphEntry.Dependencies) {
+                            if (Everest.Loader.DependencyLoaded(dependency)) {
+                                Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} is loaded");
+                            } else if (MissingDependencies.Any(dep => dep.Name == dependency.Name) || newlyMissing.Any(dep => dep.Name == dependency.Name)) {
+                                Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} is already missing");
+                            } else {
+                                Logger.Verbose("OuiDependencyDownloader", $"{dependency.Name} was added to the missing dependencies!");
+                                newlyMissing.Add(dependency);
+                            }
+                        }
+                    }
+                }
+
+                MissingDependencies.AddRange(newlyMissing);
+
+            } while (newlyMissing.Count > 0);
+        }
+
         private static bool tryUnblacklist(EverestModuleMetadata dependency, Dictionary<EverestModuleMetadata, string> allModsInformation, HashSet<string> modsToUnblacklist) {
             KeyValuePair<EverestModuleMetadata, string> match = default;
 
@@ -316,7 +354,7 @@ namespace Celeste.Mod.UI {
                             // comment this line to unblacklist this mod.
                             blacklistTxt.WriteLine("# " + line);
                             modsLeftToUnblacklist.Remove(line);
-                            Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", "Commented out line from blacklist.txt: " + line);
+                            Logger.Verbose("OuiDependencyDownloader", "Commented out line from blacklist.txt: " + line);
                         } else {
                             // copy the line as is.
                             blacklistTxt.WriteLine(line);
@@ -328,7 +366,7 @@ namespace Celeste.Mod.UI {
                     // some mods we are supposed to unblacklist aren't in the blacklist.txt file...?
                     LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_UNBLACKLIST_FAILED"));
                     foreach (string mod in modsLeftToUnblacklist) {
-                        Logger.Log(LogLevel.Warn, "OuiDependencyDownloader", "This mod could not be found in blacklist.txt: " + mod);
+                        Logger.Warn("OuiDependencyDownloader", "This mod could not be found in blacklist.txt: " + mod);
                     }
                     return false;
                 }
@@ -349,7 +387,7 @@ namespace Celeste.Mod.UI {
             try {
                 databaseVersion = new Version(databaseVersionString);
             } catch (Exception e) {
-                Logger.Log(LogLevel.Warn, "OuiDependencyDownloader", $"Could not parse version number: {databaseVersionString}");
+                Logger.Warn("OuiDependencyDownloader", $"Could not parse version number: {databaseVersionString}");
                 Logger.LogDetailed(e);
                 return false;
             }
@@ -358,29 +396,36 @@ namespace Celeste.Mod.UI {
         }
 
         private Everest.Updater.Entry findEverestVersionToInstall(int requestedBuild) {
+            // Find the entry with the highest build number and the highest priority
+            Everest.Updater.UpdatePriority updatePrio = Everest.Updater.UpdatePriority.None;
+            Everest.Updater.Entry updateEntry = null;
+
             foreach (Everest.Updater.Source source in Everest.Updater.Sources) {
-                if (source?.Entries == null)
+                if (source?.Entries == null || source?.UpdatePriority is Everest.Updater.UpdatePriority.None)
                     continue;
 
                 foreach (Everest.Updater.Entry entry in source.Entries) {
-                    if (entry.Build >= requestedBuild) {
-                        // we found a suitable build! return it.
-                        return entry;
-                    }
+                    if (entry.Build < requestedBuild)
+                        continue;
+
+                    if (source.UpdatePriority < updatePrio)
+                        continue;
+
+                    if (source.UpdatePriority == updatePrio && entry.Build < updateEntry?.Build)
+                        continue;
+
+                    updatePrio = source.UpdatePriority;
+                    updateEntry = entry;
                 }
             }
 
-            // we checked the whole version list and didn't find anything suitable, so...
-            return null;
+            return updateEntry;
         }
 
         private void downloadDependency(ModUpdateInfo mod, EverestModuleMetadata installedVersion) {
-            string downloadDestination = Path.Combine(Everest.PathGame, $"dependency-download.zip");
+            string downloadDestination = Path.Combine(Everest.PathTmp, $"dependency-download.zip");
             try {
                 // 1. Download
-                LogLine(string.Format(Dialog.Get("DEPENDENCYDOWNLOADER_DOWNLOADING"), mod.Name, mod.URL));
-                LogLine("", false);
-
                 Func<int, long, int, bool> progressCallback = (position, length, speed) => {
                     if (length > 0) {
                         Lines[Lines.Count - 1] = $"{((int) Math.Floor(100D * (position / (double) length)))}% @ {speed} KiB/s";
@@ -393,23 +438,36 @@ namespace Celeste.Mod.UI {
                     return true;
                 };
 
-                try {
-                    Everest.Updater.DownloadFileWithProgress(mod.URL, downloadDestination, progressCallback);
-                } catch (WebException e) {
-                    Logger.Log(LogLevel.Warn, "OuiDependencyDownloader", $"Download failed, trying mirror {mod.MirrorURL}");
-                    Logger.LogDetailed(e);
+                Exception downloadException = null;
 
-                    Lines[Lines.Count - 1] = string.Format(Dialog.Get("DEPENDENCYDOWNLOADER_DOWNLOADING_MIRROR"), mod.MirrorURL);
-                    LogLine("", false);
-                    Everest.Updater.DownloadFileWithProgress(mod.MirrorURL, downloadDestination, progressCallback);
+                foreach (string url in ModUpdaterHelper.GetAllMirrorUrls(mod.URL)) {
+                    try {
+                        downloadException = null;
+                        LogLine(string.Format(Dialog.Get("DEPENDENCYDOWNLOADER_DOWNLOADING"), mod.Name, url));
+                        LogLine("", false);
+
+                        Everest.Updater.DownloadFileWithProgress(url, downloadDestination, progressCallback);
+
+                        ProgressMax = 0;
+                        Lines[Lines.Count - 1] = Dialog.Clean("DEPENDENCYDOWNLOADER_DOWNLOAD_FINISHED");
+
+                        // 2. Verify checksum
+                        LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_VERIFYING_CHECKSUM"));
+                        ModUpdaterHelper.VerifyChecksum(mod, downloadDestination);
+                        break; // out of the loop
+                    } catch (Exception e) when (e is WebException or TimeoutException or IOException) {
+                        downloadException = e;
+                        Logger.Warn("OuiDependencyDownloader", $"Download failed, trying another mirror");
+                        Logger.LogDetailed(e);
+                        Lines[Lines.Count - 1] = string.Format(Dialog.Get("DEPENDENCYDOWNLOADER_DOWNLOADING_MIRROR"), "");
+                        continue; // to the next mirror
+                    }
                 }
 
-                ProgressMax = 0;
-                Lines[Lines.Count - 1] = Dialog.Clean("DEPENDENCYDOWNLOADER_DOWNLOAD_FINISHED");
-
-                // 2. Verify checksum
-                LogLine(Dialog.Clean("DEPENDENCYDOWNLOADER_VERIFYING_CHECKSUM"));
-                ModUpdaterHelper.VerifyChecksum(mod, downloadDestination);
+                if (downloadException != null) {
+                    ModUpdaterHelper.TryDelete(downloadDestination);
+                    throw downloadException;
+                }
 
                 // 3. Install mod
                 if (installedVersion != null) {
@@ -423,7 +481,17 @@ namespace Celeste.Mod.UI {
                         File.Delete(installDestination);
                     }
                     File.Move(downloadDestination, installDestination);
-                    Everest.Loader.LoadZip(installDestination);
+
+                    try {
+                        if (!shouldRestart) { // don't waste time hot loading since we're restarting anyway
+                            Everest.Loader.LoadZip(installDestination);
+                        }
+                    } catch (Exception e) {
+                        // something bad happened during the mod hot loading, log it and prompt to restart the game to load the mod.
+                        LogLine(string.Format(Dialog.Clean("DEPENDENCYDOWNLOADER_HOTLOAD_FAILED"), mod.Name));
+                        Logger.LogDetailed(e);
+                        shouldRestart = true;
+                    }
                 }
 
             } catch (Exception e) {
@@ -435,10 +503,10 @@ namespace Celeste.Mod.UI {
                 // try to delete the file if it still exists.
                 if (File.Exists(downloadDestination)) {
                     try {
-                        Logger.Log(LogLevel.Verbose, "OuiDependencyDownloader", $"Deleting temp file {downloadDestination}");
+                        Logger.Verbose("OuiDependencyDownloader", $"Deleting temp file {downloadDestination}");
                         File.Delete(downloadDestination);
                     } catch (Exception) {
-                        Logger.Log(LogLevel.Warn, "OuiDependencyDownloader", $"Removing {downloadDestination} failed");
+                        Logger.Warn("OuiDependencyDownloader", $"Removing {downloadDestination} failed");
                     }
                 }
             }
@@ -466,7 +534,7 @@ namespace Celeste.Mod.UI {
         public void Exit() {
             task = null;
             Lines.Clear();
-            MainThreadHelper.Do(() => ((patch_OuiMainMenu) Overworld.GetUI<OuiMainMenu>())?.RebuildMainAndTitle());
+            MainThreadHelper.Schedule(() => ((patch_OuiMainMenu) Overworld.GetUI<OuiMainMenu>())?.NeedsRebuild());
             Audio.Play(SFX.ui_main_button_back);
             Overworld.Goto<OuiModOptions>();
         }

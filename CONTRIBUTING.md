@@ -13,6 +13,7 @@ Contributions are very welcome and greatly appreciated! Make sure to join the [C
   - [Adding Content](#adding-content)
   - [Patching](#patching)
     - [`patch_` classes](#patch_-classes)
+    - [`Ext` classes](#ext-classes)
     - [MonoModRules](#monomodrules)
   - [Miscellaneous](#miscellaneous)
     - [Warnings](#warnings)
@@ -52,6 +53,9 @@ When making a pull request, please note the following guidelines:
 - **Testing:** if you are submitting a bugfix, describe the issue thouroughly and provide recreation steps, *especially* if it is not an existing [issue](https://github.com/EverestAPI/Everest/issues).
 - **Response:** when you submit a pull request, you are responsible for making sure any questions and change requests on it are answered in a timely manner.
 
+Once everything is ready, for it to get merged it will need to get reviewed by at least **2 members** of the Everest team. Once that has happened, there is a **3 day** last-call window in which any concerns can be brought up before it is merged. If nothing is blocking the pull request, it'll get merged once the 3 day window is over.  
+
+If a pull request would be merged within 3 days of a planned release, it will have to be merged **after** it, to ensure it has enough time to be tested before being released. The date of the next release can be found [in the Milestones section](https://github.com/EverestAPI/Everest/milestones).
 
 # Making Changes
 These are explanations and guidelines for how to make changes to the Everest source code.
@@ -89,6 +93,19 @@ There are a few attributes that can be applied to members of the class with diff
 - `[MonoModIgnore]` ignore this member, do not patch it except for MonoMod custom attributes.
 - `[MonoModConstructor]` treat this method as a constructor - [why this is needed](https://github.com/MonoMod/MonoMod/issues/51#issuecomment-496115932). 
 - `[MonoModReplace]` replace this method entirely, do not generate an `orig_` method.
+
+### `Ext` classes
+Code mods were previously created with Everest as a git submodule, which meant that any additions from Everest in `patch_` classes were not available to those mods at build time.
+
+The recommended practice has since been updated to build against a patched version of Celeste, making `Ext` classes relatively obsolete.
+
+In most cases, **new `patch_` members should not be added to their associated `Ext` class, and new `Ext` classes should not be created.**
+
+Exceptions are made when the `Ext` class contains significant additions that are not within the scope of the original class (ex: `TextMenuExt`).
+
+Existing `Ext` classes will also be kept in the following cases:
+- An associated `patch_` class member was not made public (ex: `patch_Audio.CheckFmod`)
+- Useful extension methods are defined (ex: `AreaDataExt.ToKey`)
 
 ### MonoModRules
 :information_source: **The recommended practices for MonoModRules have recently been changed as described in [this PR](https://github.com/EverestAPI/Everest/pull/351).**

@@ -1,8 +1,9 @@
 ﻿#pragma warning disable CS0626 // Method, operator, or accessor is marked external and has no attributes on it
 
+using Celeste.Mod;
 using MonoMod;
 using System;
-using System.Xml;
+using System.Collections.Generic;
 using System.Xml.Serialization;
 
 namespace Celeste {
@@ -29,13 +30,13 @@ namespace Celeste {
             get {
                 string value = _SID;
                 if ((SIDID != ID || string.IsNullOrEmpty(value)) && 0 <= ID && ID < AreaData.Areas.Count)
-                    value = AreaData.Areas[ID].GetSID();
+                    value = patch_AreaData.Areas[ID].SID;
                 return value;
             }
             set {
                 _SID = value;
                 // We want to force any legacy code to use the SID's ID.
-                ID = AreaDataExt.Get(value)?.ID ?? ID;
+                ID = patch_AreaData.Get(value)?.ID ?? ID;
                 SIDID = ID; // Last ID when the SID was set. SID is always set last.
             }
         }
@@ -52,22 +53,33 @@ namespace Celeste {
             // Only set SID if this AreaKey isn't AreaKey.Default or AreaKey.None
             if (id != -1 && AreaData.Areas != null && AreaData.Areas.Count > 0) {
                 // We don't actually check if we're in bounds as we want an exception.
-                string sid = AreaData.Areas[id].GetSID();
+                string sid = patch_AreaData.Areas[id].SID;
                 // Only set sid after load. During load, sid is still null.
                 if (sid != null)
                     SID = sid;
             }
         }
 
+        private static readonly Dictionary<string, string> _cachedSIDsToLevelSets = new Dictionary<string, string>();
+        private string computeLevelSet() {
+            Logger.Verbose("SaveData", "Recomputing AreaKey.LevelSet");
+            string sid = SID;
+            int lastIndexOfSlash = sid.LastIndexOf('/');
+            if (lastIndexOfSlash == -1) return "";
+            return sid.Substring(0, lastIndexOfSlash);
+        }
+
         public string LevelSet {
             get {
                 string sid = SID;
-                if (string.IsNullOrEmpty(sid))
+                if (string.IsNullOrEmpty(sid)) {
                     return "Celeste";
-                int lastIndexOfSlash = sid.LastIndexOf('/');
-                if (lastIndexOfSlash == -1)
-                    return "";
-                return sid.Substring(0, lastIndexOfSlash);
+                }
+                if (!_cachedSIDsToLevelSets.TryGetValue(sid, out string levelSet)) {
+                    levelSet = computeLevelSet();
+                    _cachedSIDsToLevelSets.Add(sid, levelSet);
+                }
+                return levelSet;
             }
         }
 
@@ -80,7 +92,7 @@ namespace Celeste {
                 string levelSet = LevelSet;
                 int index = 0;
                 for (int i = 0; i <= ID; i++) {
-                    if (AreaData.Areas[i].GetLevelSet() != levelSet)
+                    if (patch_AreaData.Areas[i].LevelSet != levelSet)
                         continue;
                     if (AreaData.Areas[i].Interlude)
                         continue;
@@ -98,7 +110,7 @@ namespace Celeste {
                 string levelSet = LevelSet;
                 int index = 0;
                 for (int i = 0; i <= ID; i++) {
-                    if (AreaData.Areas[i].GetLevelSet() != levelSet)
+                    if (patch_AreaData.Areas[i].LevelSet != levelSet)
                         continue;
                     index++;
                 }
@@ -119,9 +131,6 @@ namespace Celeste {
 
     }
     public static class AreaKeyExt {
-
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
 
         /// <summary>
         /// Get the name of the level set this area belongs to.

@@ -1,7 +1,7 @@
 ﻿using Celeste.Mod;
+using Celeste.Mod.Helpers;
 using Monocle;
 using MonoMod;
-using MonoMod.Utils;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -27,7 +27,7 @@ namespace Celeste {
             lock (threads) {
                 threads.Add(thread);
                 threadTimes.Add(DateTime.UtcNow);
-                threadInfos.Add($"Name: {name}\nAction: {method?.Method?.ToString() ?? method.ToString()}\nStarter:\n{new StackTrace(1)}");
+                threadInfos.Add(string.Format("Name: {0}\nAction: {1}\nStarter:\n{2}", name, method?.Method?.ToString() ?? method.ToString(), new StackTrace(1)));
             }
             Current = new WeakReference<Thread>(thread);
             thread.Start();
@@ -39,8 +39,8 @@ namespace Celeste {
                 method();
 
             } catch (ThreadAbortException e) {
-                Logger.Log(LogLevel.Warn, "RunThread", $"Background thread {Thread.CurrentThread?.Name ?? "???"} aborted");
-                e.LogDetailed();
+                Logger.Warn("RunThread", $"Background thread {Thread.CurrentThread?.Name ?? "???"} aborted");
+                Logger.LogDetailed(e);
 
             } catch (Exception e) {
                 ErrorLog.Write(e);
@@ -80,7 +80,7 @@ namespace Celeste {
                             timeout = DateTime.UtcNow + TimeSpan.FromSeconds(5);
                         if ((DateTime.UtcNow - timeout.Value).Ticks >= 0) {
                             lock (threads) {
-                                Logger.Log(LogLevel.Verbose, "RunThread.WaitAll", $"Background thread taking too long, discarding it.\n{threadInfos[0]}");
+                                Logger.Verbose("RunThread.WaitAll", $"Background thread taking too long, discarding it.\n{threadInfos[0]}");
                                 threads.RemoveAt(0);
                                 threadTimes.RemoveAt(0);
                                 threadInfos.RemoveAt(0);

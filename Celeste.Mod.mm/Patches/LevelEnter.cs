@@ -41,7 +41,10 @@ namespace Celeste {
                     Everest.Events.Level.Enter(session, fromSaveData);
                 } catch (Exception e) {
                     string sid = session?.Area.GetSID() ?? "???";
-                    Logger.Log(LogLevel.Warn, "LevelEnter", $"Failed entering map {sid}");
+                    string mapName = session?.Area != null && Dialog.Has(mapName = AreaData.Get(session.Area).Name) ? $" [{Dialog.Clean(mapName, Dialog.Languages["english"])}]" : null;
+                    if (session?.Area.Mode > 0)
+                        mapName = mapName + $" [{session.Area.Mode}]";
+                    Logger.Warn("LevelEnter", $"Failed entering map {sid}{mapName}");
                     Logger.LogDetailed(e);
 
                     ErrorMessage = Dialog.Get("postcard_levelloadfailed").Replace("((sid))", sid);
@@ -56,15 +59,15 @@ namespace Celeste {
 
         public static bool PlayCustomVignette(Session session, bool fromSaveData) {
             bool playVignette = !fromSaveData && session.StartedFromBeginning;
-            AreaData area = AreaData.Get(session);
+            patch_AreaData area = patch_AreaData.Get(session);
             MapMetaCompleteScreen screen;
             MapMetaTextVignette text;
 
-            if (playVignette && (screen = area.GetMeta()?.LoadingVignetteScreen) != null && screen.Atlas != null) {
+            if (playVignette && (screen = area.Meta?.LoadingVignetteScreen) != null && screen.Atlas != null) {
                 Engine.Scene = new CustomScreenVignette(session, meta: screen);
                 return true;
-            } else if (playVignette && (text = area.GetMeta()?.LoadingVignetteText) != null && text.Dialog != null) {
-                if (Engine.Scene is not Overworld {Snow: HiresSnow snow}) {
+            } else if (playVignette && (text = area.Meta?.LoadingVignetteText) != null && text.Dialog != null) {
+                if (Engine.Scene is not Overworld { Snow: HiresSnow snow }) {
                     snow = null;
                 }
 
@@ -84,20 +87,33 @@ namespace Celeste {
             }
 
             if (AreaData.Get(session) == null) {
-                Logger.Log(LogLevel.Warn, "LevelEnter", $"Failed to find map");
+                Logger.Warn("LevelEnter", $"Failed to find map");
                 return ErrorRoutine(Dialog.Get("postcard_levelgone")
                     .Replace("((player))", SaveData.Instance.Name)
                     .Replace("((sid))", session.Area.GetSID()));
             }
 
-            AreaData areaData = AreaData.Get(session);
-            MapMeta areaMeta = areaData.GetMeta();
-            if (areaMeta != null && areaData.GetLevelSet() != "Celeste" &&
-                Dialog.Has(areaData.Name + "_postcard") &&
+            patch_AreaData areaData = patch_AreaData.Get(session);
+            MapMeta areaMeta = areaData.Meta;
+
+            string postCardDialogInfix = "";
+            int areaModeIndex = 0;
+            
+            if (session.Area.Mode == AreaMode.BSide) {
+                postCardDialogInfix = "_b";
+                areaModeIndex = 1;
+            } else if (session.Area.Mode == AreaMode.CSide) {
+                postCardDialogInfix = "_c";
+                areaModeIndex = 2;
+            }
+
+            string postCardDialog = $"{areaData.Name}{postCardDialogInfix}_postcard";
+
+            if (areaMeta != null && areaData.LevelSet != "Celeste" &&
+                Dialog.Has(postCardDialog) &&
                 session.StartedFromBeginning && !fromSaveData &&
-                session.Area.Mode == AreaMode.Normal &&
-                (!SaveData.Instance.Areas[session.Area.ID].Modes[0].Completed || SaveData.Instance.DebugMode)) {
-                return EnterWithPostcardRoutine(Dialog.Get(areaData.Name + "_postcard"), areaMeta.PostcardSoundID);
+                (!SaveData.Instance.Areas[session.Area.ID].Modes[areaModeIndex].Completed || SaveData.Instance.DebugMode)) {
+                return EnterWithPostcardRoutine(Dialog.Get(postCardDialog), areaMeta.PostcardSoundID);
             }
 
             return orig_Routine();
@@ -122,26 +138,7 @@ namespace Celeste {
         private IEnumerator EnterWithPostcardRoutine(string message, string soundId) {
             yield return 1f;
 
-            if (string.IsNullOrEmpty(soundId))
-                soundId = "csides";
-
-            string prefix;
-            if (soundId.StartsWith("event:/")) {
-                // sound ID is a FMOD event, take it as is.
-                prefix = soundId;
-            } else if (soundId == "variants") {
-                // sound ID is "variants", this is a special case since it is in the new_content bank.
-                prefix = "event:/new_content/ui/postcard_variants";
-            } else {
-                // if a number, use event:/ui/main/postcard_ch{number}
-                // if not, use event:/ui/main/postcard_{text}
-                prefix = "event:/ui/main/postcard_";
-                if (int.TryParse(soundId, out _))
-                    prefix += "ch";
-                prefix += soundId;
-            }
-
-            Add(postcard = new Postcard(message, prefix + "_in", prefix + "_out"));
+            Add(postcard = new patch_Postcard(message, soundId));
             yield return postcard.DisplayRoutine();
 
             IEnumerator inner = orig_Routine();
@@ -171,10 +168,8 @@ namespace Celeste {
     }
     public static class LevelEnterExt {
 
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
-
         /// <inheritdoc cref="patch_LevelEnter.ErrorMessage"/>
+        [Obsolete("Use LevelEnter.ErrorMessage instead.")]
         public static string ErrorMessage {
             get {
                 return patch_LevelEnter.ErrorMessage;

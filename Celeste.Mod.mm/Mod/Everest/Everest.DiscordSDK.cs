@@ -1,10 +1,11 @@
 ﻿using Celeste.Mod.Core;
+using Celeste.Mod.Helpers;
 using Microsoft.Xna.Framework;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using System;
 using System.Collections.Generic;
-using System.Net;
+using System.Net.Http;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
@@ -34,11 +35,14 @@ namespace Celeste.Mod {
 
             internal static void LoadRichPresenceIcons() {
                 new Task(() => {
-                    JArray list = JsonConvert.DeserializeObject<JArray>(new WebClient().DownloadString(IconBaseURL + "/rich-presence-icons/list.json"));
+                    JArray list;
+                    using (HttpClient hc = new CompressedHttpClient())
+                        list = JsonConvert.DeserializeObject<JArray>(hc.GetStringAsync(IconBaseURL + "/rich-presence-icons/list.json").Result);
+
                     foreach (string element in list.Children<JValue>()) {
                         RichPresenceIcons.Add(element);
                     }
-                    Logger.Log(LogLevel.Debug, "discord-game-sdk", $"Retrieved {RichPresenceIcons.Count} existing icon hashes.");
+                    Logger.Debug("discord-game-sdk", $"Retrieved {RichPresenceIcons.Count} existing icon hashes.");
                 }).Start();
             }
 
@@ -58,11 +62,11 @@ namespace Celeste.Mod {
             private DiscordSDK(Game game) : base(game) {
                 UpdateOrder = -500000;
 
-                Logger.Log(LogLevel.Verbose, "discord-game-sdk", $"Initializing Discord Game SDK...");
+                Logger.Verbose("discord-game-sdk", $"Initializing Discord Game SDK...");
                 try {
                     DiscordInstance = new Discord.Discord(430794114037055489L, (ulong) Discord.CreateFlags.NoRequireDiscord);
                 } catch (Exception e) {
-                    Logger.Log(LogLevel.Warn, "discord-game-sdk", "Could not initialize Discord Game SDK!");
+                    Logger.Warn("discord-game-sdk", "Could not initialize Discord Game SDK!");
                     Logger.LogDetailed(e, "discord-game-sdk");
                     return;
                 }
@@ -70,7 +74,7 @@ namespace Celeste.Mod {
 
                 DiscordInstance.GetUserManager().OnCurrentUserUpdate += () => {
                     Discord.User user = DiscordInstance.GetUserManager().GetCurrentUser();
-                    Logger.Log(LogLevel.Verbose, "discord-game-sdk", $"Connected user is {user.Username}#{user.Discriminator}");
+                    Logger.Verbose("discord-game-sdk", $"Connected user is {user.Username}#{user.Discriminator}");
                 };
 
                 Events.Celeste.OnExiting += OnGameExit;
@@ -80,7 +84,7 @@ namespace Celeste.Mod {
 
                 Celeste.Instance.Components.Add(this);
 
-                Logger.Log(LogLevel.Info, "discord-game-sdk", "Discord Game SDK initialized!");
+                Logger.Info("discord-game-sdk", "Discord Game SDK initialized!");
             }
 
             protected override void Dispose(bool disposing) {
@@ -96,19 +100,19 @@ namespace Celeste.Mod {
                 Instance = null;
                 Celeste.Instance.Components.Remove(this);
 
-                Logger.Log(LogLevel.Info, "discord-game-sdk", "Discord Game SDK disposed");
+                Logger.Info("discord-game-sdk", "Discord Game SDK disposed");
             }
 
             public override void Update(GameTime gameTime) {
                 if (MustUpdatePresence) {
-                    Logger.Log(LogLevel.Verbose, "discord-game-sdk", $"Changing activity: state='{NextPresence.State}', " +
+                    Logger.Verbose("discord-game-sdk", $"Changing activity: state='{NextPresence.State}', " +
                     $"details='{NextPresence.Details}', image='{NextPresence.Assets.LargeImage}', text='{NextPresence.Assets.LargeText}', timestamp='{NextPresence.Timestamps.Start}'");
 
                     DiscordInstance.GetActivityManager().UpdateActivity(NextPresence, (result) => {
                         if (result == Discord.Result.Ok) {
-                            Logger.Log(LogLevel.Verbose, "discord-game-sdk", "Presence changed successfully!");
+                            Logger.Verbose("discord-game-sdk", "Presence changed successfully!");
                         } else {
-                            Logger.Log(LogLevel.Warn, "discord-game-sdk", $"Failed to change presence: {result}");
+                            Logger.Warn("discord-game-sdk", $"Failed to change presence: {result}");
                         }
                     });
 
@@ -118,12 +122,8 @@ namespace Celeste.Mod {
                 try {
                     DiscordInstance.RunCallbacks();
                 } catch (Discord.ResultException e) {
-                    if (e.Message == nameof(Discord.Result.NotRunning)) {
-                        Logger.Log(LogLevel.Warn, "discord-game-sdk", "Discord was shut down! Disposing Game SDK.");
-                        Dispose();
-                    } else {
-                        throw e;
-                    }
+                    Logger.Warn("discord-game-sdk", $"Failed to run Discord callbacks ({e.Message})! Disposing Game SDK.");
+                    Dispose();
                 }
             }
 
@@ -168,7 +168,7 @@ namespace Celeste.Mod {
                     }
                 } else {
                     Language english = Dialog.Languages["english"];
-                    AreaData area = AreaData.Get(session);
+                    patch_AreaData area = patch_AreaData.Get(session);
 
                     // the displayed info if "show map" was disabled: just "Playing a map"
                     string mapName = "a map";
@@ -184,7 +184,7 @@ namespace Celeste.Mod {
                             icon = GetMapIconURLCached(area);
                         }
 
-                        if (CoreModule.Settings.DiscordShowSide && area.Mode.Length >= 2 && area.Mode[2] != null) {
+                        if (CoreModule.Settings.DiscordShowSide && area.Mode.Length >= 2 && area.Mode[1] != null) {
                             side = " | " + (char) ('A' + session.Area.Mode) + "-Side";
                         }
 
@@ -193,7 +193,7 @@ namespace Celeste.Mod {
                         }
 
                         if (!IsOnlyMapInLevelSet(area)) {
-                            fullName = FilterEmojiFrom(area.GetLevelSet().DialogCleanOrNull(english) ?? area.GetLevelSet())
+                            fullName = FilterEmojiFrom(area.LevelSet.DialogCleanOrNull(english) ?? area.LevelSet)
                                 + " | " + (session.Area.ChapterIndex >= 0 ? "Chapter " + session.Area.ChapterIndex + " - " : "") + mapName;
                         } else {
                             fullName = mapName;
@@ -237,9 +237,9 @@ namespace Celeste.Mod {
                 return Regex.Replace(Emoji.Apply(s), "[" + Emoji.Start + "-" + Emoji.End + "]", "").Trim();
             }
 
-            private bool IsOnlyMapInLevelSet(AreaData area) {
-                foreach (AreaData otherArea in AreaData.Areas) {
-                    if (area.GetLevelSet() == otherArea.GetLevelSet() && area.GetSID() != otherArea.GetSID()) {
+            private bool IsOnlyMapInLevelSet(patch_AreaData area) {
+                foreach (patch_AreaData otherArea in AreaData.Areas) {
+                    if (area.LevelSet == otherArea.LevelSet && area.SID != otherArea.SID) {
                         return false;
                     }
                 }
@@ -268,7 +268,7 @@ namespace Celeste.Mod {
                         return IconBaseURL + "/rich-presence-icons-static/null.png";
                     }
                 } else {
-                    byte[] hash = ChecksumHasher.ComputeHash(icon.Data);
+                    byte[] hash = ComputeHash(icon.Data);
                     string hashString = BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
                     if (RichPresenceIcons.Contains(hashString)) {
                         return IconBaseURL + "/rich-presence-icons/" + hashString + ".png";

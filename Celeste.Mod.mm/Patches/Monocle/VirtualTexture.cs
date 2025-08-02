@@ -102,11 +102,9 @@ namespace Monocle {
                         }
                     }
 
-                    if (!MainThreadHelper.IsMainThread) { 
+                    if (!MainThreadHelper.IsMainThread) {
                         // Otherwise wait for it to get loaded. (Don't wait locked!)
-                        while (!_Texture_QueuedLoad.IsValid)
-                            Thread.Yield();
-                        return _Texture_QueuedLoad.GetResult();
+                        return _Texture_QueuedLoad.Result;
                     }
                 }
 
@@ -130,7 +128,7 @@ namespace Monocle {
         private bool _Texture_Requesting;
         private bool _Texture_UnloadAfterReload;
         private object _Texture_QueuedLoadLock;
-        private MaybeAwaitable<Texture2D> _Texture_QueuedLoad;
+        private ValueTask<Texture2D> _Texture_QueuedLoad;
         private bool _Texture_FTLCount;
         private bool _Texture_FTLLoading;
         private uint _Texture_FTLSize;
@@ -292,8 +290,10 @@ namespace Monocle {
         internal patch_VirtualTexture(string path) {
             Path = path;
             Name = path;
-            if (!Preload())
+            if (!Preload(force: Everest.Flags.IsHeadless) && !Everest.Flags.IsHeadless)
                 Reload();
+            if (Everest.Flags.IsHeadless)
+                Texture_Unsafe = new Texture2D(Engine.Graphics.GraphicsDevice, Width, Height);
         }
 
         [MonoModConstructor]
@@ -303,16 +303,20 @@ namespace Monocle {
             Width = width;
             Height = height;
             this.color = color;
-            if (!Preload())
+            if (!Preload(force: Everest.Flags.IsHeadless) && !Everest.Flags.IsHeadless)
                 Reload();
+            if (Everest.Flags.IsHeadless)
+                Texture_Unsafe = new Texture2D(Engine.Graphics.GraphicsDevice, Width, Height);
         }
 
         [MonoModConstructor]
         internal patch_VirtualTexture(ModAsset metadata) {
             Metadata = metadata;
             Name = metadata.PathVirtual;
-            if (!Preload())
+            if (!Preload(force: Everest.Flags.IsHeadless) && !Everest.Flags.IsHeadless)
                 Reload();
+            if (Everest.Flags.IsHeadless)
+                Texture_Unsafe = new Texture2D(Engine.Graphics.GraphicsDevice, Width, Height);
         }
 
         [MonoModReplace]
@@ -349,9 +353,7 @@ namespace Monocle {
 
                 if (!MainThreadHelper.IsMainThread) {
                     // Otherwise wait for it to get loaded. (Don't wait locked!)
-                    while (!_Texture_QueuedLoad.IsValid)
-                        Thread.Yield();
-                    tex = _Texture_QueuedLoad.GetResult();
+                    tex = _Texture_QueuedLoad.Result;
                 }
             }
 
@@ -360,13 +362,13 @@ namespace Monocle {
                 return;
 
             if (!(CoreModule.Settings.ThreadedGL ?? Everest.Flags.PreferThreadedGL) && !MainThreadHelper.IsMainThread) {
-                MainThreadHelper.Do(() => tex.Dispose());
+                MainThreadHelper.Schedule(() => tex.Dispose());
             } else {
                 tex.Dispose();
             }
         }
 
-        internal bool LoadImmediately => 
+        internal bool LoadImmediately =>
             !_Texture_FTLLoading && ((CoreModule.Settings.ThreadedGL ?? Everest.Flags.PreferThreadedGL) || MainThreadHelper.IsMainThread);
         internal bool Load(bool wait, Func<Texture2D> load) {
             if (LoadImmediately) {
@@ -408,13 +410,11 @@ namespace Monocle {
                     return tex;
                 };
 
-                _Texture_QueuedLoad = !_Texture_FTLLoading ?
-                    MainThreadHelper.GetForceQueue(load) :
-                    MainThreadHelper.Get(load);
+                _Texture_QueuedLoad = MainThreadHelper.Schedule(load, forceQueue: !_Texture_FTLLoading);
             }
 
             if (wait || _Texture_Requesting)
-                _Texture_QueuedLoad.GetResult();
+                _ = _Texture_QueuedLoad.Result;
 
             return false;
         }
@@ -427,6 +427,11 @@ namespace Monocle {
         [MonoModReplace]
         [PatchInitblk]
         internal override unsafe void Reload() {
+            if (Everest.Flags.IsHeadless) {
+                Texture_Unsafe = new Texture2D(Engine.Graphics.GraphicsDevice, 1, 1);
+                return;
+            }
+
             // Unload task might end up conflicting with Reload - let's instead force-unload in Load.
             // Unload();
 
@@ -445,9 +450,7 @@ namespace Monocle {
 
                 if (!MainThreadHelper.IsMainThread) {
                     // Otherwise wait for it to get loaded, don't reload twice. (Don't wait locked!)
-                    while (!_Texture_QueuedLoad.IsValid)
-                        Thread.Yield();
-                    _Texture_QueuedLoad.GetResult();
+                    _ = _Texture_QueuedLoad.Result;
                     return;
                 }
             }
@@ -460,7 +463,7 @@ namespace Monocle {
                     CountFastTextureLoad();
                     lock (queuedLoadLock = new object()) {
                         _Texture_QueuedLoadLock = queuedLoadLock;
-                        _Texture_QueuedLoad = new MaybeAwaitable<Texture2D>(Task.Run(() => {
+                        _Texture_QueuedLoad = new ValueTask<Texture2D>(Task.Run(() => {
                             try {
                                 lock (queuedLoadLock) {
                                     // Queued load cancelled or replaced with another queued load.
@@ -491,7 +494,7 @@ namespace Monocle {
                                 Celeste.patch_Celeste.CriticalFailureHandler(e);
                                 throw;
                             }
-                        }).GetAwaiter());
+                        }));
                         return;
                     }
                 }
@@ -826,7 +829,7 @@ namespace Monocle {
                 } else if (extension == ".png") {
                     // Hard.
                     using (FileStream stream = File.OpenRead(System.IO.Path.Combine(Engine.ContentDirectory, Path)))
-                        return PreloadSizeFromPNG(stream);
+                        return PreloadSizeFromPNG(stream, Path);
 
                 } else {
                     // .xnb and other file formats - impossible.
@@ -838,7 +841,7 @@ namespace Monocle {
                 if (Metadata.Format == "png") {
                     // Hard.
                     using (Stream stream = Metadata.Stream)
-                        return PreloadSizeFromPNG(stream);
+                        return PreloadSizeFromPNG(stream, $"{Metadata.PathVirtual} (mod {Metadata.Source.Mod?.Name ?? "*unknown*"})");
 
                 } else {
                     // .xnb and other file formats - impossible.
@@ -849,21 +852,21 @@ namespace Monocle {
             return false;
         }
 
-        private bool PreloadSizeFromPNG(Stream stream) {
+        private bool PreloadSizeFromPNG(Stream stream, string path) {
             using (BinaryReader reader = new BinaryReader(stream)) {
                 ulong magic = reader.ReadUInt64();
                 if (magic != 0x0A1A0A0D474E5089U) {
-                    Logger.Log(LogLevel.Error, "vtex", $"Failed preloading PNG: Expected magic to be 0x0A1A0A0D474E5089, got 0x{magic.ToString("X16")} - {Path}");
+                    Logger.Error("vtex", $"Failed preloading PNG: Expected magic to be 0x0A1A0A0D474E5089, got 0x{magic.ToString("X16")} - {path}");
                     return false;
                 }
                 uint length = reader.ReadUInt32();
                 if (length != 0x0D000000U) {
-                    Logger.Log(LogLevel.Error, "vtex", $"Failed preloading PNG: Expected first chunk length to be 0x0D000000, got 0x{length.ToString("X8")} - {Path}");
+                    Logger.Error("vtex", $"Failed preloading PNG: Expected first chunk length to be 0x0D000000, got 0x{length.ToString("X8")} - {path}");
                     return false;
                 }
                 uint chunk = reader.ReadUInt32();
                 if (chunk != 0x52444849U) {
-                    Logger.Log(LogLevel.Error, "vtex", $"Failed preloading PNG: Expected IHDR marker 0x52444849, got 0x{chunk.ToString("X8")} - {Path}");
+                    Logger.Error("vtex", $"Failed preloading PNG: Expected IHDR marker 0x52444849, got 0x{chunk.ToString("X8")} - {path}");
                     return false;
                 }
                 Width = SwapEndian(reader.ReadInt32());
@@ -883,18 +886,17 @@ namespace Monocle {
     }
     public static class VirtualTextureExt {
 
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
-
         /// <summary>
         /// If the VirtualTexture originates from a mod, get the mod asset metadata.
         /// </summary>
+        [Obsolete("Use VirtualTexture.Metadata instead.")]
         public static ModAsset GetMetadata(this VirtualTexture self)
             => ((patch_VirtualTexture) (object) self).Metadata;
 
         /// <summary>
         /// Set a fallback texture in case the texture becomes unavailable on reload.
         /// </summary>
+        [Obsolete("Use VirtualTexture.Fallback instead.")]
         public static void SetFallback(this VirtualTexture self, VirtualTexture fallback)
             => ((patch_VirtualTexture) (object) self).Fallback = fallback;
 

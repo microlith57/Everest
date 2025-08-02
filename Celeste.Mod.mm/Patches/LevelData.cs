@@ -8,6 +8,7 @@ using MonoMod;
 using MonoMod.Cil;
 using MonoMod.InlineRT;
 using MonoMod.Utils;
+using System.Collections.Generic;
 using System.Globalization;
 
 namespace Celeste {
@@ -34,6 +35,72 @@ namespace Celeste {
             if (DefaultSpawn == null && spawn.Attributes.TryGetValue("isDefaultSpawn", out object isDefaultSpawn) && Convert.ToBoolean(isDefaultSpawn, CultureInfo.InvariantCulture)) {
                 DefaultSpawn = coords;
             }
+        }
+
+        // Optimise the method
+        [MonoModReplace]
+        private EntityData CreateEntityData(BinaryPacker.Element entity) {
+            EntityData entityData = new() {
+                Name = entity.Name,
+                Level = this
+            };
+            
+            if (entity.Attributes != null) {
+                foreach ((string key, object value) in entity.Attributes) {
+                    switch (key)
+                    {
+                        case "id":
+                            entityData.ID = (int) value;
+                            break;
+                        case "x":
+                            entityData.Position.X = Convert.ToSingle(value, CultureInfo.InvariantCulture);
+                            break;
+                        case "y":
+                            entityData.Position.Y = Convert.ToSingle(value, CultureInfo.InvariantCulture);
+                            break;
+                        case "width":
+                            entityData.Width = (int) value;
+                            break;
+                        case "height":
+                            entityData.Height = (int) value;
+                            break;
+                        case "originX":
+                            entityData.Origin.X = Convert.ToSingle(value, CultureInfo.InvariantCulture);
+                            break;
+                        case "originY":
+                            entityData.Origin.Y = Convert.ToSingle(value, CultureInfo.InvariantCulture);
+                            break;
+                        default:
+                        {
+                            // We'll assume that most entities have id, x, y but not width, height, originX/Y
+                            // This means our resulting dict should have count - 3 elements in the end.
+                            // For resizable entities this makes the dict too large,
+                            // but auto-resizing from passing a capacity too small would probably make it too big anyway.
+                            entityData.Values ??= new Dictionary<string, object>(entity.Attributes.Count - 3);
+                            
+                            entityData.Values.Add(key, value);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (entity.Children is { Count: > 0 }) {
+                entityData.Nodes = new Vector2[entity.Children.Count];
+                for (int index = 0; index < entityData.Nodes.Length; index++) {
+                    var attributesFromBinary = entity.Children[index].Attributes;
+                    ref var node = ref entityData.Nodes[index];
+
+                    if (attributesFromBinary.TryGetValue("x", out object x))
+                        node.X = Convert.ToSingle(x, CultureInfo.InvariantCulture);
+                    if (attributesFromBinary.TryGetValue("y", out object y))
+                        node.Y = Convert.ToSingle(y, CultureInfo.InvariantCulture);
+                }
+            } else {
+                entityData.Nodes = Array.Empty<Vector2>();
+            }
+
+            return entityData;
         }
     }
 }
@@ -63,6 +130,8 @@ namespace MonoMod {
             TypeDefinition t_StrawberryRegistry = MonoModRule.Modder.FindType("Celeste.Mod.StrawberryRegistry")?.Resolve();
             MethodDefinition m_TrackableContains = t_StrawberryRegistry.FindMethod("System.Boolean TrackableContains(Celeste.BinaryPacker/Element)");
 
+            bool found = false;
+
             Mono.Collections.Generic.Collection<Instruction> instrs = method.Body.Instructions;
             for (int instri = 0; instri < instrs.Count; instri++) {
                 Instruction instr = instrs[instri];
@@ -83,7 +152,12 @@ namespace MonoMod {
                     instrs[instri - 1].OpCode = OpCodes.Nop;
                     instrs[instri + 1].Operand = m_TrackableContains;
                     instri++;
+                    found = true;
                 }
+            }
+
+            if (!found) {
+                throw new Exception("No \"strawberry\" string found in " + method.FullName + "!");
             }
         }
 
@@ -91,9 +165,16 @@ namespace MonoMod {
         public static void PatchLevelDataDecalLoader(ILContext context, CustomAttribute attrib) {
             TypeDefinition t_DecalData = MonoModRule.Modder.FindType("Celeste.DecalData").Resolve();
             TypeDefinition t_BinaryPackerElement = MonoModRule.Modder.FindType("Celeste.BinaryPacker/Element").Resolve();
+            TypeDefinition t_Extensions = MonoModRule.Modder.FindType("Celeste.Mod.Extensions").Resolve();
+
+            MethodDefinition m_BinaryPackerElementHasAttr         = t_BinaryPackerElement.FindMethod("HasAttr");
+            MethodDefinition m_BinaryPackerElementAttr            = t_BinaryPackerElement.FindMethod("Attr");
+            MethodDefinition m_BinaryPackerElementAttrFloat       = t_BinaryPackerElement.FindMethod("AttrFloat");
+            MethodDefinition m_BinaryPackerElementAttrNullableInt = t_Extensions.FindMethod("AttrNullableInt");
 
             FieldDefinition f_DecalDataRotation = t_DecalData.FindField("Rotation");
-            MethodDefinition m_BinaryPackerElementAttrFloat = t_BinaryPackerElement.FindMethod("AttrFloat");
+            FieldDefinition f_DecalDataColorHex = t_DecalData.FindField("ColorHex");
+            FieldDefinition f_DecalDataDepth    = t_DecalData.FindField("Depth");
 
             ILCursor cursor = new ILCursor(context);
 
@@ -108,6 +189,9 @@ namespace MonoMod {
 
                 // we are trying to add:
                 //   decaldata.Rotation = element.AttrFloat("rotation", 0.0f);
+                //   decaldata.ColorHex = element.AttrString("color", "");
+                //   if (element.HasAttr("depth"))
+                //      decaldata.Depth = element.AttrNullableInt("depth");
 
                 // copy the reference to the DecalData
                 cursor.Emit(OpCodes.Dup);
@@ -115,9 +199,38 @@ namespace MonoMod {
                 cursor.Emit(OpCodes.Ldloc, loc_element);
                 cursor.Emit(OpCodes.Ldstr, "rotation");
                 cursor.Emit(OpCodes.Ldc_R4, 0.0f);
-                cursor.Emit(OpCodes.Callvirt, m_BinaryPackerElementAttrFloat);
+                cursor.Emit(OpCodes.Call, m_BinaryPackerElementAttrFloat);
                 // put the rotation into the DecalData
                 cursor.Emit(OpCodes.Stfld, f_DecalDataRotation);
+
+                // copy the reference to the DecalData again
+                cursor.Emit(OpCodes.Dup);
+                // load the hex color from the BinaryPacker.Element
+                cursor.Emit(OpCodes.Ldloc, loc_element);
+                cursor.Emit(OpCodes.Ldstr, "color");
+                cursor.Emit(OpCodes.Ldstr, "");
+                cursor.Emit(OpCodes.Call, m_BinaryPackerElementAttr);
+                // put the color into the DecalData
+                cursor.Emit(OpCodes.Stfld, f_DecalDataColorHex);
+
+                // find out if there is a depth field in the BinaryPacker.Element
+                cursor.Emit(OpCodes.Ldloc, loc_element);
+                cursor.Emit(OpCodes.Ldstr, "depth");
+                cursor.Emit(OpCodes.Call, m_BinaryPackerElementHasAttr);
+                // if not, skip to after setting it
+                ILLabel after_attr_depth = cursor.DefineLabel();
+                cursor.Emit(OpCodes.Brfalse_S, after_attr_depth);
+
+                // copy the reference to the DecalData again
+                cursor.Emit(OpCodes.Dup);
+                // load the depth from the BinaryPacker.Element
+                cursor.Emit(OpCodes.Ldloc, loc_element);
+                cursor.Emit(OpCodes.Ldstr, "depth");
+                cursor.Emit(OpCodes.Call, m_BinaryPackerElementAttrNullableInt);
+                // put the depth into the DecalData
+                cursor.Emit(OpCodes.Stfld, f_DecalDataDepth);
+
+                cursor.MarkLabel(after_attr_depth);
 
                 matches++;
             }

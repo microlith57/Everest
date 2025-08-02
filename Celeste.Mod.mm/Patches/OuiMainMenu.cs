@@ -18,6 +18,18 @@ namespace Celeste {
         public List<MenuButton> Buttons => buttons;
         private MainMenuClimb climbButton;
 
+        [MonoModReplace]
+        public new Color SelectionColor {
+            get {
+                if (CoreModule.Settings.AllowTextHighlight && !base.Scene.BetweenInterval(0.1f)) {
+                    return TextMenu.HighlightColorB;
+                }
+                return TextMenu.HighlightColorA;
+            }
+        }
+
+        private bool needsRebuild = false;
+
         public extern void orig_CreateButtons();
         public new void CreateButtons() {
             orig_CreateButtons();
@@ -27,7 +39,22 @@ namespace Celeste {
             UpdateLayout();
         }
 
-        public void RebuildMainAndTitle() {
+        public void NeedsRebuild() {
+            needsRebuild = true;
+        }
+
+        public extern void orig_Update();
+        public new void Update() {
+            // rebuild only on update to prevent multiple rebuilds per frame
+            if (needsRebuild) {
+                RebuildMainAndTitle();
+                needsRebuild = false;
+            }
+
+            orig_Update();
+        }
+
+        private void RebuildMainAndTitle() {
             Overworld oui = Overworld;
             oui.UIs.Remove(oui.GetUI<OuiTitleScreen>());
             Oui title = new OuiTitleScreen() {
@@ -45,6 +72,8 @@ namespace Celeste {
                 break;
             }
 
+            // this cannot be called more than once per frame, otherwise the
+            // scene keeps orphaned menu buttons which messes with selection
             CreateButtons();
 
             if (selected is MainMenuClimb) {
@@ -52,9 +81,9 @@ namespace Celeste {
                     button.SetSelected(button is MainMenuClimb);
                 }
             } else {
-                string selectedLabel = (selected as MainMenuSmallButton)?.GetLabelName();
+                string selectedLabel = (selected as patch_MainMenuSmallButton)?.LabelName;
                 foreach (MenuButton button in buttons) {
-                    button.SetSelected((button as MainMenuSmallButton)?.GetLabelName() == selectedLabel);
+                    button.SetSelected((button as patch_MainMenuSmallButton)?.LabelName == selectedLabel);
                 }
             }
         }
@@ -193,10 +222,10 @@ namespace Celeste {
 
         private int findButtonIndex(string labelName, string iconName) {
             return buttons.FindIndex(_ => {
-                MainMenuSmallButton other = (_ as MainMenuSmallButton);
+                patch_MainMenuSmallButton other = (_ as patch_MainMenuSmallButton);
                 if (other == null)
                     return false;
-                return other.GetLabelName() == labelName && other.GetIconName() == iconName;
+                return other.LabelName == labelName && other.IconName == iconName;
             });
         }
 
@@ -222,9 +251,7 @@ namespace Celeste {
     }
     public static class OuiMainMenuExt {
 
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
-
+        [Obsolete("Use OuiMainMenu.Buttons instead.")]
         public static List<MenuButton> GetButtons(this OuiMainMenu self)
             => ((patch_OuiMainMenu) self).Buttons;
 

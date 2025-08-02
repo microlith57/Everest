@@ -14,6 +14,8 @@ using System.Xml.Serialization;
 namespace Celeste {
     public class patch_SaveData : SaveData {
 
+        public static new patch_SaveData Instance;
+
         public List<LevelSetStats> LevelSets = new List<LevelSetStats>();
 
         public List<LevelSetStats> LevelSetRecycleBin = new List<LevelSetStats>();
@@ -26,29 +28,42 @@ namespace Celeste {
         [XmlIgnore]
         public static int LoadedModSaveDataIndex = int.MinValue;
 
+        private LevelSetStats _cached_LevelSetStats = null;
+        private string _cached_LevelSetStats_LevelSet = null;
+        private LevelSetStats computeLevelSetStats() {
+            Logger.Verbose("SaveData", "Recomputing SaveData.LevelSetStats");
+            string name = LastArea.GetLevelSet() ?? "Celeste";
+            LevelSetStats set = LevelSets.Find(other => other.Name == name);
+
+            if (set == null) {
+                // Just silently add the missing levelset.
+                LevelSets.Add(set = new LevelSetStats {
+                    SaveData = this,
+                    Name = name,
+                    UnlockedAreas = 0
+                });
+                _cached_Areas_Safe = null;
+            }
+
+            // If the levelset doesn't exist in AreaData.Areas anymore (offset == -1), fall back.
+            if (name != "Celeste" && set.AreaOffset == -1) {
+                LastArea = AreaKey.Default;
+                // Recurse - get the new, proper level set.
+                return LevelSetStats;
+            }
+
+            return set;
+        }
+
         [XmlIgnore]
         public LevelSetStats LevelSetStats {
             get {
                 string name = LastArea.GetLevelSet() ?? "Celeste";
-                LevelSetStats set = LevelSets.Find(other => other.Name == name);
-
-                if (set == null) {
-                    // Just silently add the missing levelset.
-                    LevelSets.Add(set = new LevelSetStats {
-                        SaveData = this,
-                        Name = name,
-                        UnlockedAreas = 0
-                    });
+                if (_cached_LevelSetStats == null || _cached_LevelSetStats_LevelSet != name) {
+                    _cached_LevelSetStats = computeLevelSetStats();
+                    _cached_LevelSetStats_LevelSet = name;
                 }
-
-                // If the levelset doesn't exist in AreaData.Areas anymore (offset == -1), fall back.
-                if (name != "Celeste" && set.AreaOffset == -1) {
-                    LastArea = AreaKey.Default;
-                    // Recurse - get the new, proper level set.
-                    return LevelSetStats;
-                }
-
-                return set;
+                return _cached_LevelSetStats;
             }
         }
 
@@ -139,19 +154,29 @@ namespace Celeste {
         public new List<AreaStats> Areas;
 
         [MonoModRemove]
-        public List<AreaStats> Areas_Unsafe;
+        public List<patch_AreaStats> Areas_Unsafe;
+
+        private List<patch_AreaStats> _cached_Areas_Safe = null;
+        private List<patch_AreaStats> computeAreasSafe() {
+            Logger.Verbose("SaveData", "Recomputing SaveData.Areas_Safe");
+            List<patch_AreaStats> areasAll = new List<patch_AreaStats>(Areas_Unsafe);
+            foreach (LevelSetStats set in LevelSets) {
+                areasAll.AddRange(set.Areas);
+            }
+            return areasAll;
+        }
 
         [XmlIgnore]
         [MonoModLinkFrom("System.Collections.Generic.List`1<Celeste.AreaStats> Celeste.SaveData::Areas")]
-        public List<AreaStats> Areas_Safe {
+        public List<patch_AreaStats> Areas_Safe {
             get {
-                List<AreaStats> areasAll = new List<AreaStats>(Areas_Unsafe);
-                foreach (LevelSetStats set in LevelSets) {
-                    areasAll.AddRange(set.Areas);
-                }
-                return areasAll;
+                _cached_Areas_Safe ??= computeAreasSafe();
+                return _cached_Areas_Safe;
             }
             set {
+                _cached_Areas_Safe = null;
+                _cached_LevelSetStats = null;
+
                 if (LevelSets == null && value.Count == 0) {
                     Areas_Unsafe = value;
                     return;
@@ -221,7 +246,7 @@ namespace Celeste {
             [MonoModReplace] // optimise the method
             get {
                 int totalCassettes = 0;
-                List<AreaStats> areas = Areas_Safe; // this getter hides extremely expensive calculations. Evil!
+                List<patch_AreaStats> areas = Areas_Safe; // this getter hides extremely expensive calculations. Evil!
                 int maxArea = MaxArea;
 
                 for (int i = 0; i <= maxArea; ++i) {
@@ -357,18 +382,18 @@ namespace Celeste {
                 ModSaveData modSaveData = UserIO.Load<ModSaveData>(GetFilename(FileSlot) + "-modsavedata");
                 if (modSaveData != null) {
                     modSaveData.CopyToCelesteSaveData(this);
-                    Logger.Log(LogLevel.Warn, "SaveData", $"{LevelSets.Count} level set(s) were restored from mod backup for save slot {FileSlot}");
+                    Logger.Warn("SaveData", $"{LevelSets.Count} level set(s) were restored from mod backup for save slot {FileSlot}");
                 }
             }
 
             HasModdedSaveData = true;
 
             if (Areas_Unsafe == null)
-                Areas_Unsafe = new List<AreaStats>();
+                Areas_Unsafe = new List<patch_AreaStats>();
 
             // Add missing LevelSetStats.
-            foreach (AreaData area in AreaData.Areas) {
-                string set = area.GetLevelSet();
+            foreach (patch_AreaData area in AreaData.Areas) {
+                string set = area.LevelSet;
                 if (!LevelSets.Exists(other => other.Name == set)) {
                     LevelSetStats recycleBinLevelSet = LevelSetRecycleBin.FirstOrDefault(other => other.Name == set);
                     if (recycleBinLevelSet != null) {
@@ -389,7 +414,7 @@ namespace Celeste {
             for (int lsi = 0; lsi < LevelSets.Count; lsi++) {
                 LevelSetStats set = LevelSets[lsi];
                 set.SaveData = this;
-                List<AreaStats> areas = set.Areas;
+                List<patch_AreaStats> areas = set.Areas;
                 if (set.Name == "Celeste")
                     areas = Areas_Unsafe;
 
@@ -415,13 +440,13 @@ namespace Celeste {
                 // Refresh all stat IDs based on their SIDs, sort, fill and remove leftovers.
                 // Temporarily use ID_Unsafe; later ID_Safe to ID_Unsafe to resync the SIDs.
                 // This keeps the stats bound to their SIDs, not their indices, while removing non-existent areas.
-                int countRoots = AreaData.Areas.Count(other => other.GetLevelSet() == set.Name && string.IsNullOrEmpty(other?.GetMeta()?.Parent));
-                int countAll = AreaData.Areas.Count(other => other.GetLevelSet() == set.Name);
+                int countRoots = patch_AreaData.Areas.Count(other => other.LevelSet == set.Name && string.IsNullOrEmpty(other?.Meta?.Parent));
+                int countAll = patch_AreaData.Areas.Count(other => other.LevelSet == set.Name);
 
                 // Fix IDs
                 for (int i = 0; i < areas.Count; i++) {
-                    AreaData area = AreaDataExt.Get(areas[i]);
-                    if (!string.IsNullOrEmpty(area?.GetMeta()?.Parent))
+                    patch_AreaData area = patch_AreaData.Get(areas[i]);
+                    if (!string.IsNullOrEmpty(area?.Meta?.Parent))
                         area = null;
                     ((patch_AreaStats) areas[i]).ID_Unsafe = area?.ID ?? int.MaxValue;
                 }
@@ -436,12 +461,12 @@ namespace Celeste {
                 // Fill gaps
                 for (int i = 0; i < countRoots; i++)
                     if (i >= areas.Count || ((patch_AreaStats) areas[i]).ID_Unsafe != offset + i)
-                        areas.Insert(i, new AreaStats(offset + i));
+                        areas.Insert(i, new patch_AreaStats(offset + i));
 
                 // Duplicate parent stat refs into their respective children slots.
                 for (int i = countRoots; i < countAll; i++) {
                     if (i >= areas.Count) {
-                        areas.Insert(i, areas[AreaDataExt.Get(AreaData.Get(offset + i).GetMeta().Parent).ID - offset]);
+                        areas.Insert(i, areas[patch_AreaData.Get(patch_AreaData.Get(offset + i).Meta.Parent).ID - offset]);
                     }
                 }
 
@@ -460,7 +485,7 @@ namespace Celeste {
                     if (UnlockedAreas_Unsafe < lastCompleted + 1 && set.MaxArea >= lastCompleted + 1) {
                         UnlockedAreas_Unsafe = lastCompleted + 1;
                     }
-                    if (DebugMode) {
+                    if (DebugMode || CheatMode) {
                         UnlockedAreas_Unsafe = set.MaxArea;
                     }
 
@@ -468,7 +493,7 @@ namespace Celeste {
                     if (set.UnlockedAreas < lastCompleted + 1 && set.MaxArea >= lastCompleted + 1) {
                         set.UnlockedAreas = lastCompleted + 1;
                     }
-                    if (DebugMode) {
+                    if (DebugMode || CheatMode) {
                         set.UnlockedAreas = set.MaxArea;
                     }
                 }
@@ -534,6 +559,9 @@ namespace Celeste {
                     }
                 }
             }
+
+            _cached_Areas_Safe = null;
+            _cached_LevelSetStats = null;
         }
 
         public extern void orig_BeforeSave();
@@ -550,8 +578,8 @@ namespace Celeste {
             foreach (LevelSetStats set in LevelSets) {
                 if (set.Name == "Celeste")
                     continue;
-                int countRoots = AreaData.Areas.Count(other => other.GetLevelSet() == set.Name && string.IsNullOrEmpty(other?.GetMeta()?.Parent));
-                List<AreaStats> areas = set.Areas;
+                int countRoots = patch_AreaData.Areas.Count(other => other.LevelSet == set.Name && string.IsNullOrEmpty(other?.Meta?.Parent));
+                List<patch_AreaStats> areas = set.Areas;
                 while (areas.Count > countRoots)
                     areas.RemoveAt(areas.Count - 1);
             }
@@ -567,7 +595,7 @@ namespace Celeste {
             => LevelSets.Find(set => set.Name == name);
 
         public AreaStats GetAreaStatsFor(AreaKey key)
-            => LevelSets.Find(set => set.Name == key.GetLevelSet()).Areas.Find(area => area.GetSID() == key.GetSID());
+            => LevelSets.Find(set => set.Name == key.GetLevelSet()).Areas.Find(area => area.SID == key.GetSID());
 
         public extern HashSet<string> orig_GetCheckpoints(AreaKey area);
         public new HashSet<string> GetCheckpoints(AreaKey area) {
@@ -617,9 +645,9 @@ namespace Celeste {
             }
         }
 
-        public List<AreaStats> Areas = new List<AreaStats>();
+        public List<patch_AreaStats> Areas = new List<patch_AreaStats>();
         [XmlIgnore]
-        public List<AreaStats> AreasIncludingCeleste => Name == "Celeste" ? SaveData.Areas_Unsafe : Areas;
+        public List<patch_AreaStats> AreasIncludingCeleste => Name == "Celeste" ? SaveData.Areas_Unsafe : Areas;
 
         public List<string> Poem = new List<string>();
 
@@ -658,7 +686,7 @@ namespace Celeste {
 
                     for (int j = 0; j < areaData.Mode.Length && j < areaSave.Modes.Length; j++) {
                         AreaModeStats modeSave = areaSave.Modes[j];
-                        ModeProperties modeData = areaData.Mode[j];
+                        patch_ModeProperties modeData = (patch_ModeProperties) areaData.Mode[j];
 
                         if (modeSave == null || modeData == null)
                             continue;
@@ -666,7 +694,7 @@ namespace Celeste {
                         foreach (EntityID strawb in modeSave.Strawberries) {
                             if (modeData.MapData.Goldenberries.Any(berry => berry.ID == strawb.ID && berry.Level.Name == strawb.Level))
                                 count++;
-                            if (modeData.MapData.GetDashlessGoldenberries().Any(berry => berry.ID == strawb.ID && berry.Level.Name == strawb.Level))
+                            if (modeData.MapData.DashlessGoldenberries.Any(berry => berry.ID == strawb.ID && berry.Level.Name == strawb.Level))
                                 count++;
                         }
                     }
@@ -704,10 +732,10 @@ namespace Celeste {
                 int offset = AreaOffset;
                 int count = 0;
                 for (int i = 0; i <= MaxArea; i++) {
-                    foreach (ModeProperties mode in AreaData.Areas[offset + i].Mode) {
+                    foreach (patch_ModeProperties mode in AreaData.Areas[offset + i].Mode) {
                         if (mode == null)
                             continue;
-                        count += mode.MapData.GetDetectedStrawberriesIncludingUntracked();
+                        count += mode.MapData.DetectedStrawberriesIncludingUntracked;
                     }
                 }
                 return count;
@@ -723,11 +751,11 @@ namespace Celeste {
                 int offset = AreaOffset;
                 int count = 0;
                 for (int i = 0; i <= MaxArea; i++) {
-                    foreach (ModeProperties mode in AreaData.Areas[offset + i].Mode) {
+                    foreach (patch_ModeProperties mode in AreaData.Areas[offset + i].Mode) {
                         if (mode == null)
                             continue;
                         count += mode.MapData.Goldenberries.Count;
-                        count += mode.MapData.GetDashlessGoldenberries().Count;
+                        count += mode.MapData.DashlessGoldenberries.Count;
                     }
                 }
                 return count;
@@ -743,10 +771,10 @@ namespace Celeste {
                 int offset = AreaOffset;
                 int count = 0;
                 for (int i = 0; i <= MaxArea; i++) {
-                    foreach (ModeProperties mode in AreaData.Areas[offset + i].Mode) {
+                    foreach (patch_ModeProperties mode in AreaData.Areas[offset + i].Mode) {
                         if (mode == null)
                             continue;
-                        if (mode.MapData.GetDetectedCassette())
+                        if (mode.MapData.DetectedCassette)
                             count++;
                     }
                 }
@@ -804,9 +832,9 @@ namespace Celeste {
         }
 
         internal void ComputeBounds() {
-            AreaOffset = AreaData.Areas.FindIndex(area => area.GetLevelSet() == Name);
+            AreaOffset = patch_AreaData.Areas.FindIndex(area => area.LevelSet == Name);
 
-            int count = AreaData.Areas.Count(area => area.GetLevelSet() == Name && string.IsNullOrEmpty(area.GetMeta()?.Parent)) - 1;
+            int count = patch_AreaData.Areas.Count(area => area.LevelSet == Name && string.IsNullOrEmpty(area.Meta?.Parent)) - 1;
             if (Celeste.PlayMode == Celeste.PlayModes.Event)
                 MaxArea = Math.Min(count, AreaOffset + 2);
             else
@@ -871,7 +899,7 @@ namespace Celeste {
                 if (Name == "Celeste")
                     return 9;
 
-                return AreaData.Areas.Count(area => area.GetLevelSet() == Name && !area.Interlude);
+                return patch_AreaData.Areas.Count(area => area.LevelSet == Name && !area.Interlude);
             }
         }
 
@@ -939,17 +967,16 @@ namespace Celeste {
     }
     public static class SaveDataExt {
 
-        // Mods can't access patch_ classes directly.
-        // We thus expose any new members through extensions.
-
         /// <summary>
         /// Get the statistics for all level sets.
         /// </summary>
+        [Obsolete("Use SaveData.LevelSets instead.")]
         public static List<LevelSetStats> GetLevelSets(this SaveData self)
             => ((patch_SaveData) self).LevelSets;
         /// <summary>
         /// Set the statistics for all level sets.
         /// </summary>
+        [Obsolete("Use SaveData.LevelSets instead.")]
         public static SaveData SetLevelSets(this SaveData self, List<LevelSetStats> value) {
             ((patch_SaveData) self).LevelSets = value;
             return self;
@@ -958,16 +985,19 @@ namespace Celeste {
         /// <summary>
         /// Get the last played level set.
         /// </summary>
+        [Obsolete("Use SaveData.LevelSet instead.")]
         public static string GetLevelSet(this SaveData self)
             => ((patch_SaveData) self).LevelSet;
 
         /// <summary>
         /// Get the statistics for the last played level set.
         /// </summary>
+        [Obsolete("Use SaveData.LevelSetStats instead.")]
         public static LevelSetStats GetLevelSetStats(this SaveData self)
             => ((patch_SaveData) self).LevelSetStats;
 
         /// <inheritdoc cref="patch_SaveData.GetLevelSetStatsFor(string)"/>
+        [Obsolete("Use SaveData.GetLevelSetStatsFor instead.")]
         public static LevelSetStats GetLevelSetStatsFor(this SaveData self, string name)
             => ((patch_SaveData) self).GetLevelSetStatsFor(name);
 

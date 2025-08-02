@@ -1,23 +1,22 @@
-﻿using Celeste.Mod.Helpers;
+using Celeste.Mod.Helpers;
 using Celeste.Mod.Meta;
-using Ionic.Zip;
 using MAB.DotIgnore;
 using Microsoft.Xna.Framework.Graphics;
 using Monocle;
-using MonoMod.Utils;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Celeste.Mod {
 
     /// <summary>
-    /// Special meta type for assets. 
+    /// Special meta type for assets.
     /// A ModAsset with a Type field that subclasses from this will not log path conflicts.
     /// </summary>
     public abstract class AssetTypeNonConflict { }
@@ -38,6 +37,7 @@ namespace Celeste.Mod {
     public sealed class AssetTypeDirectory : AssetTypeNonConflict { private AssetTypeDirectory() { } }
     public sealed class AssetTypeMetadataYaml : AssetTypeNonConflict { private AssetTypeMetadataYaml() { } }
     public sealed class AssetTypeSpriteBank : AssetTypeNonConflict { private AssetTypeSpriteBank() { } }
+    public sealed class AssetTypeEverestIgnore : AssetTypeNonConflict { private AssetTypeEverestIgnore() { } }
 
     // Generic asset types
     public sealed class AssetTypeLua { private AssetTypeLua() { } }
@@ -180,8 +180,8 @@ namespace Celeste.Mod {
 
                 watcher.EnableRaisingEvents = true;
             } catch (Exception e) {
-                Logger.Log(LogLevel.Warn, "content", $"Failed watching folder: {path}");
-                e.LogDetailed();
+                Logger.Warn("content", $"Failed watching folder: {path}");
+                Logger.LogDetailed(e);
                 watcher?.Dispose();
                 watcher = null;
             }
@@ -206,7 +206,7 @@ namespace Celeste.Mod {
                 lastIndexOfSlash >= root.Length && // Make sure to not skip crawling in hidden mods.
                 dir.Length > lastIndexOfSlash + 1 &&
                 dir[lastIndexOfSlash + 1] == '.') {
-                // Logger.Log(LogLevel.Verbose, "content", $"Skipped crawling hidden file or directory {dir.Substring(root.Length + 1)}");
+                // Logger.Verbose("content", $"Skipped crawling hidden file or directory {dir.Substring(root.Length + 1)}");
                 return;
             }
 
@@ -282,12 +282,12 @@ namespace Celeste.Mod {
             if (e.ChangeType == WatcherChangeTypes.Changed && Directory.Exists(e.FullPath))
                 return;
 
-            Logger.Log(LogLevel.Verbose, "content", $"File updated: {e.FullPath} - {e.ChangeType}");
+            Logger.Verbose("content", $"File updated: {e.FullPath} - {e.ChangeType}");
             QueuedTaskHelper.Do(e.FullPath, () => Update(e.FullPath, e.FullPath));
         }
 
         private void FileRenamed(object source, RenamedEventArgs e) {
-            Logger.Log(LogLevel.Verbose, "content", $"File renamed: {e.OldFullPath} - {e.FullPath}");
+            Logger.Verbose("content", $"File renamed: {e.OldFullPath} - {e.FullPath}");
             QueuedTaskHelper.Do(Tuple.Create(e.OldFullPath, e.FullPath), () => Update(e.OldFullPath, e.FullPath));
         }
 
@@ -367,15 +367,6 @@ namespace Celeste.Mod {
     }
 
     public class ZipModContent : ModContent {
-        private static readonly FieldInfo f_ZipEntry__container =
-            typeof(ZipEntry).GetField("_container", BindingFlags.NonPublic | BindingFlags.Instance);
-        private static readonly FieldInfo f_ZipEntry__CompressionMethod_FromZipFile =
-            typeof(ZipEntry).GetField("_CompressionMethod_FromZipFile", BindingFlags.NonPublic | BindingFlags.Instance);
-        private static readonly FieldInfo f_ZipEntry__CompressedFileDataSize =
-            typeof(ZipEntry).GetField("_CompressedFileDataSize", BindingFlags.NonPublic | BindingFlags.Instance);
-        private static readonly FieldInfo f_ZipEntry__archiveStream =
-            typeof(ZipEntry).GetField("_archiveStream", BindingFlags.NonPublic | BindingFlags.Instance);
-
         public override string DefaultName => System.IO.Path.GetFileName(Path);
 
         /// <summary>
@@ -383,94 +374,35 @@ namespace Celeste.Mod {
         /// </summary>
         public readonly string Path;
 
-        /// <summary>
-        /// The loaded archive containing the mod content.
-        /// </summary>
-        public readonly ZipFile Zip;
-
-        private readonly ZipModSecret Secret;
-        private object _container;
-
-        public class ZipModSecret {
-            private ZipModContent Content;
-            internal ZipModSecret(ZipModContent content) {
-                Content = content;
-            }
-            public ZipEntry OpenParaEntry(ZipEntry real) => Content.OpenParaEntry(real);
-            public void CloseParaEntry(ZipEntry fake) => Content.CloseParaEntry(fake);
-        }
-
-        private class ZipPoolEntry {
-            public Stream Value;
-        }
-
-        private ConcurrentBag<ZipPoolEntry> Pool = new ConcurrentBag<ZipPoolEntry>();
+        private readonly ZipArchive zip;
 
         public ZipModContent(string path) {
             Path = path;
-            Zip = OpenZip();
-            Secret = new ZipModSecret(this);
-        }
-
-        public ZipFile OpenZip() => new ZipFile(Path);
-
-        private ZipEntry OpenParaEntry(ZipEntry real) {
-            Stream stream;
-
-            Retake:
-            if (Pool.TryTake(out ZipPoolEntry pooled)) {
-                stream = Interlocked.Exchange(ref pooled.Value, null);
-                if (stream == null)
-                    goto Retake;
-                stream.Seek(0, SeekOrigin.Begin);
-            } else {
-                // Same as DotNetZip itself. Luckily we're not dealing with segmented (multi-part) zips.
-                stream = File.Open(Path, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Write);
-            }
-
-            // TODO: ILHook CloneForNewZipFile to adapt it to our needs and to simplify the following code.
-            // Nothing else should be using it anyway (and if anything does, copy method with DynamicMethodDefinition).
-
-            // Thanks, DotNetZip, for being unwilling to clone uncompressed entries in compressed zips?!
-            // ZipEntry has got a special CompressionMethod setter while ZipFile doesn't.
-            // Let's hope that its value isn't used anywhere else...
-            ZipEntry fake;
-            lock (Zip) {
-                Zip.CompressionMethod = real.CompressionMethod;
-                fake = real.CloneForNewZipFile(Zip);
-            }
-            // Can't re-set the compression methods as this might be conflicting with other ongoing clonings.
-            f_ZipEntry__container.SetValue(fake, _container ??= f_ZipEntry__container.GetValue(real));
-            f_ZipEntry__CompressionMethod_FromZipFile.SetValue(fake, (short) real.CompressionMethod);
-            f_ZipEntry__CompressedFileDataSize.SetValue(fake, f_ZipEntry__CompressedFileDataSize.GetValue(real));
-            f_ZipEntry__archiveStream.SetValue(fake, stream);
-            return fake;
-        }
-
-        private void CloseParaEntry(ZipEntry fake) {
-            // Allow reopens - even by other threads - within a certain timeframe.
-            Stream stream = (Stream) f_ZipEntry__archiveStream.GetValue(fake);
-            ZipPoolEntry pooled = new ZipPoolEntry() {
-                Value = stream
-            };
-            Pool.Add(pooled);
-            QueuedTaskHelper.Do(stream, 1.5, () => Interlocked.Exchange(ref pooled.Value, null)?.Dispose());
+            zip = ZipFile.OpenRead(path);
         }
 
         protected override void Crawl() {
-            foreach (ZipEntry entry in Zip.Entries) {
-                string entryName = entry.FileName.Replace('\\', '/');
-                if (entryName.EndsWith("/"))
-                    continue;
-                Add(entryName, new ZipModAsset(this, Secret, entry));
+            lock (zip) {
+                foreach (ZipArchiveEntry entry in zip.Entries) {
+                    string entryName = entry.FullName.Replace('\\', '/');
+                    if (entryName.EndsWith("/")) continue;
+                    Add(entryName, new ZipModAsset(this, entry.FullName));
+                }
+            }
+        }
+
+        public Stream Open(string path) {
+            lock (zip) {
+                ZipArchiveEntry entry = zip.GetEntry(path);
+                if (entry == null) throw new KeyNotFoundException($"File {path} not found in archive {Path}");
+                return new SynchronizedZipEntryStream(entry);
             }
         }
 
         protected override void Dispose(bool disposing) {
-            base.Dispose(disposing);
-            Zip.Dispose();
-            foreach (ZipPoolEntry pooled in Pool) {
-                Interlocked.Exchange(ref pooled.Value, null)?.Dispose();
+            lock (zip) {
+                base.Dispose(disposing);
+                zip.Dispose();
             }
         }
     }
@@ -510,7 +442,7 @@ namespace Celeste.Mod {
             };
 
             internal readonly static HashSet<string> BlacklistExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
-                ".cs", ".csproj", ".md", ".pdb", ".sln", ".yaml-backup"
+                ".cs", ".csproj", ".md", ".pdb", ".sln", ".yaml-backup", ".gitignore"
             };
 
             internal readonly static HashSet<string> BlacklistRootFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
@@ -531,7 +463,7 @@ namespace Celeste.Mod {
                 Celeste.Instance.Content = new EverestContentManager(Celeste.Instance.Content);
 
                 Directory.CreateDirectory(PathContentOrig = Path.Combine(PathGame, Celeste.Instance.Content.RootDirectory));
-                Directory.CreateDirectory(PathDUMP = Path.Combine(PathEverest, "ModDUMP"));
+                PathDUMP = Path.Combine(PathEverest, "ModDUMP");
 
                 Crawl(new AssemblyModContent(typeof(Everest).Assembly) {
                     Name = "Everest",
@@ -632,7 +564,7 @@ namespace Celeste.Mod {
                     if (pathSplit[i].StartsWith(".") || BlacklistFolders.Contains(pathSplit[i]) || (i == 0 && BlacklistRootFolders.Contains(pathSplit[0])))
                         return false;
                 }
-                
+
                 if (metadata != null &&
                     (metadata.Source?.Ignore?.IsIgnored(path, metadata.Type == typeof(AssetTypeDirectory)) ?? false)) {
                     return false;
@@ -663,7 +595,7 @@ namespace Celeste.Mod {
 
                     } else {
                         if (Map.TryGetValue(path, out ModAsset existing) && existing != null && existing.Source != metadata.Source && !existing.Type.IsSubclassOf(typeof(AssetTypeNonConflict))) {
-                            Logger.Log(LogLevel.Warn, "content", $"CONFLICT for asset path {path} ({existing?.Source?.Name ?? "???"} vs {metadata?.Source?.Name ?? "???"})");
+                            Logger.Warn("content", $"CONFLICT for asset path {path} ({existing?.Source?.Name ?? "???"} vs {metadata?.Source?.Name ?? "???"})");
                         }
 
                         Map[path] = metadata;
@@ -714,8 +646,9 @@ namespace Celeste.Mod {
             /// Subscribe to this event to register your own custom types.
             /// </summary>
             public static event TypeGuesser OnGuessType;
+
             /// <summary>
-            /// Guess the file type and format based on its path. 
+            /// Guess the file type and format based on its path.
             /// </summary>
             /// <param name="file">The relative asset path.</param>
             /// <param name="type">The file type.</param>
@@ -724,104 +657,322 @@ namespace Celeste.Mod {
             public static string GuessType(string file, out Type type, out string format) {
                 type = typeof(object);
                 format = Path.GetExtension(file) ?? "";
-                if (format.Length >= 1)
-                    format = format.Substring(1);
 
-                // Assign game asset types 
-                if (format == "dll") {
+                if (format.Length < 1)
+                    return file;
+
+                format = format[1..];
+
+                ReadOnlySpan<char> fileSpan = file.AsSpan();
+                int fileSeparator = fileSpan.LastIndexOf('/') + 1;
+
+                // folder with / at the end
+                ReadOnlySpan<char> directorySpan = fileSpan[..fileSeparator]; // don't use Path.GetDirectoryName as it replaces '/' with '\' :catplush:
+                // file
+                ReadOnlySpan<char> fileNameSpan = fileSpan[fileSeparator..];
+                // file without extension
+                ReadOnlySpan<char> fileNameOnlySpan = Path.GetFileNameWithoutExtension(fileNameSpan);
+
+                bool warningAlreadySent = false;
+
+                if (MatchExtension(fileSpan, fileNameSpan, "dll", ref warningAlreadySent)) {
                     type = typeof(AssetTypeAssembly);
+                    return fileSpan.ToString();
+                }
 
-                } else if (format == "png") {
+                if (MatchExtension(fileSpan, fileNameSpan, "png", ref warningAlreadySent)) {
                     type = typeof(Texture2D);
-                    file = file.Substring(0, file.Length - 4);
+                    return fileSpan[..^4].ToString();
+                }
 
-                } else if (format == "obj") {
+                if (MatchExtension(fileSpan, fileNameSpan, "obj", ref warningAlreadySent, isTextBased: true)) {
                     type = typeof(ObjModel);
-                    file = file.Substring(0, file.Length - 4);
+                    return fileSpan[..^4].ToString();
+                }
 
-                } else if (file.EndsWith(".obj.export")) {
+                if (MatchMultipartExtension(fileSpan, fileNameSpan, "obj.export", ref warningAlreadySent)) {
                     type = typeof(AssetTypeObjModelExport);
-                    file = file.Substring(0, file.Length - 7);
+                    return fileSpan[..^7].ToString();
+                }
 
-                } else if (file == "metadata.yaml" || file == "multimetadata.yaml" || file == "everest.yaml" || file == "everest.yml") {
+                if (MatchExtension(fileSpan, fileNameSpan, "yaml", ref warningAlreadySent, isTextBased: true)
+                    && directorySpan.IsEmpty
+                    && SpanEqualsAny(fileNameOnlySpan, "metadata", "multimetadata", "everest")) {
                     type = typeof(AssetTypeMetadataYaml);
-                    file = file.Substring(0, file.Length - format.Length - 1);
                     format = "yml";
+                    return fileSpan[..^5].ToString();
+                }
 
-                } else if (file == "DecalRegistry.xml") {
-                    type = typeof(AssetTypeDecalRegistry);
-                    file = file.Substring(0, file.Length - 4);
+                if (MatchExtension(fileSpan, fileNameSpan, "yml", ref warningAlreadySent, isTextBased: true)
+                    && directorySpan.IsEmpty
+                    && SpanEquals(fileNameOnlySpan, "everest")) {
+                    type = typeof(AssetTypeMetadataYaml);
+                    return fileSpan[..^4].ToString();
+                }
 
-                } else if (file == "Graphics/Sprites.xml" || file == "Graphics/SpritesGui.xml" || file == "Graphics/Portraits.xml") {
-                    type = typeof(AssetTypeSpriteBank);
-                    file = file.Substring(0, file.Length - 4);
+                if (MatchExtension(fileSpan, fileNameSpan, "xml", ref warningAlreadySent, isTextBased: true)) {
+                    if (directorySpan.IsEmpty && SpanEquals(fileNameOnlySpan, "DecalRegistry")) {
+                        type = typeof(AssetTypeDecalRegistry);
+                        return fileSpan[..^4].ToString();
+                    }
+                    if (SpanEquals(directorySpan, "Graphics/") && SpanEqualsAny(fileNameOnlySpan, "Sprites", "SpritesGui", "Portraits")) {
+                        type = typeof(AssetTypeSpriteBank);
+                        return fileSpan[..^4].ToString();
+                    }
+                }
 
-                } else if (file.StartsWith("Dialog/")) {
-                    if (format == "txt") {
+                if (directorySpan.IsEmpty && fileNameOnlySpan.IsEmpty && MatchExtension(fileSpan, fileNameSpan, "everestignore", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeEverestIgnore);
+                    return "";
+                }
+
+                if (directorySpan.StartsWith("Dialog/")) {
+                    if (MatchExtension(fileSpan, fileNameSpan, "txt", ref warningAlreadySent, isTextBased: true)) {
                         type = typeof(AssetTypeDialog);
-                        file = file.Substring(0, file.Length - 4);
-                    } else if (file.EndsWith(".txt.export")) {
+                        return fileSpan[..^4].ToString();
+                    }
+                    if (MatchMultipartExtension(fileSpan, fileNameSpan, "txt.export", ref warningAlreadySent)) {
                         type = typeof(AssetTypeDialogExport);
-                        file = file.Substring(0, file.Length - 7);
-                    } else if (format == "fnt") {
+                        return fileSpan[..^7].ToString();
+                    }
+                    if (MatchExtension(fileSpan, fileNameSpan, "fnt", ref warningAlreadySent, isTextBased: true)) {
                         type = typeof(AssetTypeFont);
-                        file = file.Substring(0, file.Length - 4);
+                        return fileSpan[..^4].ToString();
                     }
+                }
 
-                } else if (file.StartsWith("Maps/") && format == "bin") {
-                    type = typeof(AssetTypeMap);
-                    file = file.Substring(0, file.Length - 4);
+                if (MatchExtension(fileSpan, fileNameSpan, "bin", ref warningAlreadySent)) {
+                    if (directorySpan.StartsWith("Maps/")) {
+                        type = typeof(AssetTypeMap);
+                        return fileSpan[..^4].ToString();
+                    }
+                    if (directorySpan.StartsWith("Tutorials/")) {
+                        type = typeof(AssetTypeTutorial);
+                        return fileSpan[..^4].ToString();
+                    }
+                }
 
-                } else if (file.StartsWith("Tutorials/") && format == "bin") {
-                    type = typeof(AssetTypeTutorial);
-                    file = file.Substring(0, file.Length - 4);
-
-                } else if (file.StartsWith("Audio/")) {
-                    if (format == "bank") {
+                if (directorySpan.StartsWith("Audio/")) {
+                    if (MatchExtension(fileSpan, fileNameSpan, "bank", ref warningAlreadySent)) {
                         type = typeof(AssetTypeBank);
-                        file = file.Substring(0, file.Length - 5);
-                    } else if (file.EndsWith(".guids.txt")) {
-                        type = typeof(AssetTypeGUIDs);
-                        file = file.Substring(0, file.Length - 4);
-                    } else if (file.EndsWith(".GUIDs.txt")) { // Default FMOD casing
-                        type = typeof(AssetTypeGUIDs);
-                        file = file.Substring(0, file.Length - 4 - 6);
-                        file += ".guids";
+                        return fileSpan[..^5].ToString();
                     }
+                    if (MatchMultipartExtension(fileSpan, fileNameSpan, "guids.txt", ref warningAlreadySent, isTextBased: true)) {
+                        type = typeof(AssetTypeGUIDs);
+                        return fileSpan[..^4].ToString();
+                    }
+                    if (MatchMultipartExtension(fileSpan, fileNameSpan, "GUIDs.txt", ref warningAlreadySent, isTextBased: true)) {
+                        // default fmod casing
+                        type = typeof(AssetTypeGUIDs);
 
-                } else if (OnGuessType != null) {
-                    // Parse custom types from mods
-                    Delegate[] ds = OnGuessType.GetInvocationList();
-                    for (int i = 0; i < ds.Length; i++) {
-                        string fileMod = ((TypeGuesser) ds[i])(file, out Type typeMod, out string formatMod);
+                        Span<char> newFileSpan = fileSpan[..^4].ToArray();
+
+                        for (int i = 1; i <= 5; i++)
+                            newFileSpan[^i] = char.ToLower(newFileSpan[^i]);
+
+                        return newFileSpan.ToString();
+                    }
+                }
+
+                if (OnGuessType != null) {
+                    // parse custom types from mods
+                    foreach (Delegate typeGuesser in OnGuessType.GetInvocationList()) {
+                        string fileMod = ((TypeGuesser) typeGuesser)(file, out Type typeMod, out string formatMod);
+
                         if (fileMod == null || typeMod == null || formatMod == null)
                             continue;
+
                         file = fileMod;
                         type = typeMod;
                         format = formatMod;
-                        break;
+
+                        return file;
                     }
                 }
 
-                // Assign supported generic types if we haven't found a more specific one
-                if (type == typeof(object)) {
-                    if (format == "lua") {
-                        type = typeof(AssetTypeLua);
-                        file = file.Substring(0, file.Length - 4);
-                    } else if (format == "txt") {
-                        type = typeof(AssetTypeText);
-                        file = file.Substring(0, file.Length - 4);
-                    } else if (format == "xml") {
-                        type = typeof(AssetTypeXml);
-                        file = file.Substring(0, file.Length - 4);
-                    } else if (format == "yml" || format == "yaml") {
-                        type = typeof(AssetTypeYaml);
-                        file = file.Substring(0, file.Length - format.Length - 1);
-                        format = "yml";
+                // assign supported generic types if we haven't found a more specific one
+                if (MatchExtension(fileSpan, fileNameSpan, "lua", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeLua);
+                    return fileSpan[..^4].ToString();
+                }
+                if (MatchExtension(fileSpan, fileNameSpan, "txt", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeText);
+                    return fileSpan[..^4].ToString();
+                }
+                if (MatchExtension(fileSpan, fileNameSpan, "xml", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeXml);
+                    return fileSpan[..^4].ToString();
+                }
+                if (MatchExtension(fileSpan, fileNameSpan, "yml", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeYaml);
+                    return fileSpan[..^4].ToString();
+                }
+                if (MatchExtension(fileSpan, fileNameSpan, "yaml", ref warningAlreadySent, isTextBased: true)) {
+                    type = typeof(AssetTypeYaml);
+                    format = "yml";
+                    return fileSpan[..^5].ToString();
+                }
+
+                return fileSpan.ToString();
+            }
+
+            private static bool SpanEqualsAny(ReadOnlySpan<char> left, params string[] right) {
+                foreach (string expected in right)
+                    if (left.Equals(expected, StringComparison.Ordinal))
+                        return true;
+                return false;
+            }
+
+            private static bool SpanEquals(ReadOnlySpan<char> left, string right)
+                => left.Equals(right, StringComparison.Ordinal);
+
+            /// <summary>
+            ///   Match a file extension, and log a warning if the file extension is duplicated.<br/>
+            ///   If the file is text-based, log a warning if the file has an extra <c>.txt</c> extension.
+            /// </summary>
+            /// <param name="filePath">
+            ///   The path of the file. Used when logging the warning.
+            /// </param>
+            /// <param name="fileName">
+            ///   The file name to check, with the extensions.
+            /// </param>
+            /// <param name="expectedExtension">
+            ///   The extension to check for, without the leading dot.
+            /// </param>
+            /// <param name="warningAlreadySent">
+            ///   Whether a warning has already been sent about the file name extension(s).
+            /// </param>
+            /// <param name="isTextBased">
+            ///   Whether the file is text-based, and to check for an extra <c>.txt</c> extension.
+            /// </param>
+            private static bool MatchExtension(
+                ReadOnlySpan<char> filePath,
+                ReadOnlySpan<char> fileName,
+                ReadOnlySpan<char> expectedExtension,
+                ref bool warningAlreadySent,
+                bool isTextBased = false) {
+                ReadOnlySpan<char> extension = Path.GetExtension(fileName);
+
+                if (extension.IsEmpty)
+                    return false;
+
+                // remove the leading dot
+                extension = extension[1..];
+
+                if (extension.Equals(expectedExtension, StringComparison.Ordinal)) {
+                    // this is silly, but it works
+                    extension = Path.GetExtension(Path.GetFileNameWithoutExtension(fileName));
+
+                    if (!warningAlreadySent && !extension.IsEmpty && extension[1..].Equals(expectedExtension, StringComparison.Ordinal)) {
+                        Logger.Warn("Content", $"\"{filePath}\" has a doubled extension! It may not be handled correctly.");
+                        warningAlreadySent = true;
+                    }
+
+                    return true;
+                }
+
+                if (warningAlreadySent)
+                    // we don't care anymore if a warning has already been logged
+                    return false;
+
+                if (isTextBased && extension.Equals("txt", StringComparison.Ordinal)) {
+                    extension = Path.GetExtension(Path.GetFileNameWithoutExtension(fileName));
+
+                    if (!extension.IsEmpty && extension[1..].Equals(expectedExtension, StringComparison.Ordinal)) {
+                        Logger.Warn("Content", $"\"{filePath}\" has an extra \".txt\" extension! It may not be handled correctly.");
+                        warningAlreadySent = true;
                     }
                 }
 
-                return file;
+                return false;
+            }
+
+            /// <summary>
+            ///   Match a multipart file extension, and log a warning if the last part of the file extension is duplicated.<br/>
+            ///   If the file is text-based, log a warning if the file has an extra <c>.txt</c> extension.
+            /// </summary>
+            /// <param name="filePath">
+            ///   The path of the file. Used when logging the warning.
+            /// </param>
+            /// <param name="fileName">
+            ///   The file name to check, with the extensions.
+            /// </param>
+            /// <param name="expectedExtension">
+            ///   The multipart extension to check for, without the leading dot.
+            /// </param>
+            /// <param name="warningAlreadySent">
+            ///   Whether a warning has already been sent about the file name extension(s).
+            /// </param>
+            /// <param name="isTextBased">
+            ///   Whether the file is text-based, and to check for an extra <c>.txt</c> extension.
+            /// </param>
+            private static bool MatchMultipartExtension(
+                ReadOnlySpan<char> filePath,
+                ReadOnlySpan<char> fileName,
+                ReadOnlySpan<char> expectedExtension,
+                ref bool warningAlreadySent,
+                bool isTextBased = false) {
+                // use the simpler function if this is just a singlepart extension
+                if (expectedExtension.IndexOf('.') == -1)
+                    return MatchExtension(filePath, fileName, expectedExtension, ref warningAlreadySent, isTextBased);
+
+                // find all indices of '.'
+                List<int> expectedExtensionDotIndices = new List<int>();
+                for (int i = expectedExtension.Length - 1; i >= 0; i--)
+                    if (expectedExtension[i] == '.')
+                        expectedExtensionDotIndices.Add(i);
+
+                List<int> fileNameDotIndices = new List<int>();
+                for (int i = Path.GetFileName(fileName).Length - 1; i >= 0; i--)
+                    if (fileName[i] == '.')
+                        fileNameDotIndices.Add(i);
+
+                if (fileNameDotIndices.Count - expectedExtensionDotIndices.Count < 1)
+                    // the file name doesn't have enough extension parts to match
+                    // fileName must have at least one more dot than expectedExtension
+                    return false;
+
+                // find the dot which would be where the extension should be
+                int expectedExtensionIndex = fileNameDotIndices[expectedExtensionDotIndices.Count];
+
+                // (+1 to remove the leading dot)
+                if (fileName[(expectedExtensionIndex + 1)..].Equals(expectedExtension, StringComparison.Ordinal))
+                    // extensions match perfectly
+                    return true;
+
+                if (warningAlreadySent)
+                    // we don't care anymore if a warning has already been logged
+                    return false;
+
+                // move past the extra extension and try to match
+                if ((fileNameDotIndices.Count - 1) - expectedExtensionDotIndices.Count < 1)
+                    // there's no more extension parts to check for
+                    return false;
+
+                expectedExtensionIndex = fileNameDotIndices[expectedExtensionDotIndices.Count + 1];
+                int actualExtensionIndex = fileNameDotIndices[0];
+
+                // the intended extension
+                ReadOnlySpan<char> intendedExtension = fileName[(expectedExtensionIndex + 1)..actualExtensionIndex];
+                // the actual extension (so a .txt or a duplicate extension)
+                ReadOnlySpan<char> actualExtension = fileName[(actualExtensionIndex + 1)..];
+                // (+1 to remove the leading dot)
+
+                if (intendedExtension.Equals(expectedExtension, StringComparison.Ordinal)) {
+                    // there's an extra extension at the end - check whether it's a duplicated extension or
+                    // an extra .txt extension if it's a text-based file - but only if we haven't warned about this one yet
+
+                    ReadOnlySpan<char> lastIntendedExtensionPart = expectedExtension[expectedExtensionDotIndices[0]..];
+                    if (actualExtension.Equals(lastIntendedExtensionPart, StringComparison.Ordinal)) {
+                        Logger.Warn("Content", $"\"{filePath}\" has a doubled extension! It may not be handled correctly.");
+                        warningAlreadySent = true;
+                    } else if (actualExtension.Equals("txt", StringComparison.Ordinal)) {
+                        Logger.Warn("Content", $"\"{filePath}\" has an extra \".txt\" extension! It may not be handled correctly.");
+                        warningAlreadySent = true;
+                    }
+                }
+
+                return false;
             }
 
             private static void RecrawlMod(ModContent mod) {
@@ -834,10 +985,11 @@ namespace Celeste.Mod {
             /// Invoked when content is being updated, allowing you to handle it.
             /// </summary>
             public static event Action<ModAsset, ModAsset> OnUpdate;
+
             public static void Update(ModAsset prev, ModAsset next) {
                 if (prev != null) {
                     foreach (object target in prev.Targets) {
-                        if (target is MTexture mtex) {
+                        if (target is patch_MTexture mtex) {
                             AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_UNLOADINGTEXTURE")} {Path.GetFileName(prev.PathVirtual)}", () => {
                                 mtex.UndoOverride(prev);
                             });
@@ -863,19 +1015,19 @@ namespace Celeste.Mod {
                             .FirstOrDefault(modeSel => modeSel?.MapData?.Filename == mapName);
 
                         if (mode != null) {
-                            AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMAPNAME")} {name}", () => {
+                            AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMAPNAME")} {name}", _ => {
                                 mode.MapData.Reload();
-                            });
-
-                            if (levelPrev?.Session.MapData == mode.MapData)
-                                AssetReloadHelper.ReloadLevel();
-
+                                return Task.CompletedTask;
+                            }).ContinueWith(_ => MainThreadHelper.Schedule(() => {
+                                if (levelPrev?.Session.MapData == mode.MapData)
+                                    AssetReloadHelper.ReloadLevel();
+                            }));
                         } else {
                             // What can go wrong?
-                            AssetReloadHelper.Do(Dialog.Clean("ASSETRELOADHELPER_RELOADINGALLMAPS"), () => {
+                            AssetReloadHelper.Do(Dialog.Clean("ASSETRELOADHELPER_RELOADINGALLMAPS"), _ => {
                                 AssetReloadHelper.ReloadAllMaps();
-                            });
-                            AssetReloadHelper.ReloadLevel();
+                                return Task.CompletedTask;
+                            }).ContinueWith(_ => AssetReloadHelper.ReloadLevel());
                         }
 
                     } else if (next.Type == typeof(AssetTypeXml) || next.Type == typeof(AssetTypeSpriteBank)) {
@@ -913,9 +1065,9 @@ namespace Celeste.Mod {
                         } else {
                             MTNExt.ObjModelCache.Remove(next.PathVirtual + ".export");
                         }
-                        MainThreadHelper.Do(() => MTNExt.ReloadModData());
+                        MainThreadHelper.Schedule(() => MTNExt.ReloadModData());
                     } else if (next.Type == typeof(AssetTypeFont)) {
-                        MainThreadHelper.Do(() => Fonts.Reload());
+                        MainThreadHelper.Schedule(() => Fonts.Reload());
                     }
 
                     // Loaded assets can be folders, which means that we need to check the updated assets' entire path.
@@ -954,7 +1106,7 @@ namespace Celeste.Mod {
 
                 if (_ContentLoaded) {
                     // We're late-loading this mod and thus need to manually ingest new assets.
-                    Logger.Log(LogLevel.Verbose, "content", $"Late ingest via update for {meta.Name}");
+                    Logger.Verbose("content", $"Late ingest via update for {meta.Name}");
 
                     Stopwatch loadTimerPrev = Celeste.LoadTimer; // Trick AssetReloadHelper into insta-running callbacks.
                     Stopwatch loadTimer = Stopwatch.StartNew();
@@ -974,6 +1126,7 @@ namespace Celeste.Mod {
             /// Invoked when content is being processed (most likely on load), allowing you to manipulate it.
             /// </summary>
             public static event Action<object, string> OnProcessLoad;
+
             /// <summary>
             /// Process an asset and register it for further reprocessing in the future.
             /// Apply any mod-related changes to the asset based on the existing mod asset meta map.
@@ -1009,22 +1162,23 @@ namespace Celeste.Mod {
             /// Invoked when content is being processed (most likely on load or runtime update), allowing you to manipulate it.
             /// </summary>
             public static event Action<object, ModAsset, bool> OnProcessUpdate;
+
             public static void ProcessUpdate(object asset, ModAsset mapping, bool load) {
                 if (asset == null || mapping == null)
                     return;
 
-                if (asset is Atlas atlas) {
+                if (asset is patch_Atlas atlas) {
                     string reloadingText = Dialog.Language == null ? "" : Dialog.Clean(mapping.Children.Count == 0 ? "ASSETRELOADHELPER_RELOADINGTEXTURE" : "ASSETRELOADHELPER_RELOADINGTEXTURES");
                     AssetReloadHelper.Do(load, $"{reloadingText} {Path.GetFileName(mapping.PathVirtual)}", () => {
                         atlas.ResetCaches();
-                        (atlas as patch_Atlas).Ingest(mapping);
+                        atlas.Ingest(mapping);
                     });
 
                     // if the atlas is (or contains) an emoji, register it.
                     if (Emoji.IsInitialized()) {
                         if (refreshEmojis(mapping)) {
-                            MainThreadHelper.Do(() => {
-                                Logger.Log(LogLevel.Verbose, "content", "Reloading fonts after late emoji registration");
+                            MainThreadHelper.Schedule(() => {
+                                Logger.Verbose("content", "Reloading fonts after late emoji registration");
                                 Fonts.Reload();
                             });
                         }
@@ -1033,7 +1187,7 @@ namespace Celeste.Mod {
                     if ((MTNExt.ModsLoaded || MTNExt.ModsDataLoaded) && potentiallyContainsMountainTextures(mapping)) {
                         AssetReloadHelper.Do(load, Dialog.Clean("ASSETRELOADHELPER_RELOADINGMOUNTAIN"), () => {
                             MTNExt.ReloadMod();
-                            MainThreadHelper.Do(() => MTNExt.ReloadModData());
+                            MainThreadHelper.Schedule(() => MTNExt.ReloadModData());
                         });
                     }
                 }
@@ -1055,7 +1209,7 @@ namespace Celeste.Mod {
                     }
                 } else if (mapping.PathVirtual.StartsWith("Graphics/Atlases/Gui/emoji/")) {
                     string emojiName = mapping.PathVirtual.Substring(27);
-                    Logger.Log(LogLevel.Verbose, "content", $"Late registering emoji: {emojiName}");
+                    Logger.Verbose("content", $"Late registering emoji: {emojiName}");
                     Emoji.Register(emojiName, GFX.Gui["emoji/" + emojiName]);
                     return true;
                 }
@@ -1092,7 +1246,7 @@ namespace Celeste.Mod {
 
                 // TODO: Find how to differentiate between Packer and PackerNoAtlas
                 foreach (string file in Directory.EnumerateFiles(Path.Combine(PathContentOrig, "Graphics", "Atlases"), "*.meta", SearchOption.AllDirectories)) {
-                    Logger.Log(LogLevel.Verbose, "dump-all-atlas-meta", "file: " + file);
+                    Logger.Verbose("dump-all-atlas-meta", "file: " + file);
                     // THIS IS HORRIBLE.
                     try {
                         Atlas.FromAtlas(file.Substring(0, file.Length - 5), Atlas.AtlasDataFormat.Packer).Dispose();
@@ -1119,7 +1273,7 @@ namespace Celeste.Mod {
                 string pathDump = Path.Combine(PathDUMP, assetName);
                 Directory.CreateDirectory(Path.GetDirectoryName(pathDump));
 
-                Logger.Log(LogLevel.Verbose, "dump", $"{assetNameFull} {asset.GetType().FullName}");
+                Logger.Verbose("dump", $"{assetNameFull} {asset.GetType().FullName}");
 
                 if (asset is IMeta) {
                     if (!File.Exists(pathDump + ".meta.yaml"))
@@ -1153,7 +1307,7 @@ namespace Celeste.Mod {
                     }
                     /**/
 
-                } else if (asset is Atlas atlas) {
+                } else if (asset is patch_Atlas atlas) {
 
                     /*
                     for (int i = 0; i < atlas.Sources.Count; i++) {
@@ -1171,7 +1325,7 @@ namespace Celeste.Mod {
                     }
                     */
 
-                    Dictionary<string, MTexture> textures = atlas.GetTextures();
+                    Dictionary<string, MTexture> textures = atlas.Textures;
                     foreach (KeyValuePair<string, MTexture> kvp in textures) {
                         string name = kvp.Key;
                         MTexture source = kvp.Value;

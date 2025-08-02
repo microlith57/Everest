@@ -1,13 +1,19 @@
-﻿using Celeste.Mod.Core;
+using Celeste.Mod.Backdrops;
+using Celeste.Mod.Core;
+using Celeste.Mod.Entities;
 using Celeste.Mod.Helpers;
-using Ionic.Zip;
+using Celeste.Mod.Registry;
 using MAB.DotIgnore;
+using Microsoft.Xna.Framework;
+using Monocle;
 using MonoMod.Utils;
 using System;
+using System.Collections.Immutable;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
 
@@ -28,11 +34,17 @@ namespace Celeste.Mod {
             /// The path to the Everest /Mods/blacklist.txt file.
             /// </summary>
             public static string PathBlacklist { get; internal set; }
-            internal static List<string> _Blacklist = new List<string>();
+            internal static HashSet<string> _Blacklist = new HashSet<string>();
             /// <summary>
             /// The currently loaded mod blacklist.
             /// </summary>
-            public static ReadOnlyCollection<string> Blacklist => _Blacklist?.AsReadOnly();
+            public static IReadOnlyCollection<string> Blacklist => _Blacklist.ToImmutableHashSet();
+
+            /// <summary>
+            /// The path to the Everest /Mods/favorites.txt file.
+            /// </summary>
+            public static string PathFavorites { get; internal set; }
+            internal static HashSet<string> Favorites = new HashSet<string>();
 
             /// <summary>
             /// The path to the Everest /Mods/temporaryblacklist.txt file.
@@ -62,6 +74,7 @@ namespace Celeste.Mod {
             private static bool enforceOptionalDependencies;
 
             internal static HashSet<string> FilesWithMetadataLoadFailures = new HashSet<string>();
+            internal static HashSet<EverestModuleMetadata> ModsWithAssemblyLoadFailures = new HashSet<EverestModuleMetadata>();
 
             internal static readonly Version _VersionInvalid = new Version(int.MaxValue, int.MaxValue, int.MaxValue, int.MaxValue);
             internal static readonly Version _VersionMax = new Version(int.MaxValue, int.MaxValue);
@@ -106,10 +119,11 @@ namespace Celeste.Mod {
 
                 PathBlacklist = Path.Combine(PathMods, "blacklist.txt");
                 if (File.Exists(PathBlacklist)) {
-                    _Blacklist = File.ReadAllLines(PathBlacklist).Select(l => (l.StartsWith("#") ? "" : l).Trim()).ToList();
+                    _Blacklist = File.ReadAllLines(PathBlacklist).Select(l => (l.StartsWith("#") ? "" : l).Trim()).ToHashSet<string>();
                 } else {
                     using (StreamWriter writer = File.CreateText(PathBlacklist)) {
                         writer.WriteLine("# This is the blacklist. Lines starting with # are ignored.");
+                        writer.WriteLine("# Mod folders and archives listed in this file will be disabled.");
                         writer.WriteLine("ExampleFolder");
                         writer.WriteLine("SomeMod.zip");
                     }
@@ -151,32 +165,51 @@ namespace Celeste.Mod {
                     }
                 }
 
+                PathFavorites = Path.Combine(PathMods, "favorites.txt");
+                if (File.Exists(PathFavorites)) {
+                    Favorites = new HashSet<string>(File.ReadAllLines(PathFavorites).Select(l => (l.StartsWith("#") ? "" : l).Trim()));
+                } else {
+                    using (StreamWriter writer = File.CreateText(PathFavorites)) {
+                        writer.WriteLine("# This is the favorites list. Lines starting with # are ignored.");
+                    }
+                }
+
                 Stopwatch watch = Stopwatch.StartNew();
 
                 enforceOptionalDependencies = true;
 
-                string[] files = Directory.GetFiles(PathMods);
-                for (int i = 0; i < files.Length; i++) {
-                    string file = Path.GetFileName(files[i]);
-                    if (!file.EndsWith(".zip") || !ShouldLoadFile(file))
-                        continue;
+                string[] files = Directory
+                    .GetFiles(PathMods)
+                    .OrderBy(f => f) //Prevent inode loading jank
+                    .Select(Path.GetFileName)
+                    .Where(file => file.EndsWith(".zip") && ShouldLoadFile(file))
+                    .ToArray();
+                   
+                string[] dirs = Directory
+                    .GetDirectories(PathMods)
+                    .OrderBy(f => f) //Prevent inode loading jank
+                    .Select(Path.GetFileName)
+                    .Where(file => file != "Cache" && ShouldLoadFile(file))
+                    .ToArray();
+
+                EverestSplashHandler.SetSplashLoadingModCount(files.Length + dirs.Length);
+
+                foreach (string file in files) {
                     LoadZip(Path.Combine(PathMods, file));
                 }
-
-                files = Directory.GetDirectories(PathMods);
-                for (int i = 0; i < files.Length; i++) {
-                    string file = Path.GetFileName(files[i]);
-                    if (file == "Cache" || !ShouldLoadFile(file))
-                        continue;
-                    LoadDir(Path.Combine(PathMods, file));
+                foreach (string dir in dirs) {
+                    LoadDir(Path.Combine(PathMods, dir));
                 }
 
                 enforceOptionalDependencies = false;
-                Logger.Log(LogLevel.Info, "loader", "Loading mods with unsatisfied optional dependencies (if any)");
+                Logger.Info("loader", "Loading mods with unsatisfied optional dependencies (if any)");
                 Everest.CheckDependenciesOfDelayedMods();
 
+                EverestSplashHandler.AllModsLoaded();
+
                 watch.Stop();
-                Logger.Log(LogLevel.Verbose, "loader", $"ALL MODS LOADED IN {watch.ElapsedMilliseconds}ms");
+                Logger.Verbose("loader", $"ALL MODS LOADED IN {watch.ElapsedMilliseconds}ms");
+                Logger.Info("loader", $"Loaded {Everest._Modules.Count} modules");
 
                 try {
                     Watcher = new FileSystemWatcher {
@@ -189,8 +222,8 @@ namespace Celeste.Mod {
                     Watcher.EnableRaisingEvents = true;
                     AutoLoadNewMods = true;
                 } catch (Exception e) {
-                    Logger.Log(LogLevel.Warn, "loader", $"Failed watching folder: {PathMods}");
-                    e.LogDetailed();
+                    Logger.Warn("loader", $"Failed watching folder: {PathMods}");
+                    Logger.LogDetailed(e);
                     Watcher?.Dispose();
                     Watcher = null;
                 }
@@ -200,13 +233,13 @@ namespace Celeste.Mod {
                 if (!AutoLoadNewMods)
                     return;
 
-                Logger.Log(LogLevel.Info, "loader", $"Possible new mod container: {e.FullPath}");
-                QueuedTaskHelper.Do("LoadAutoUpdated:" + e.FullPath, () => AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_LOADINGNEWMOD")} {Path.GetFileName(e.FullPath)}", () => MainThreadHelper.Do(() => {
+                Logger.Info("loader", $"Possible new mod container: {e.FullPath}");
+                QueuedTaskHelper.Do("LoadAutoUpdated:" + e.FullPath, () => AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_LOADINGNEWMOD")} {Path.GetFileName(e.FullPath)}", () => MainThreadHelper.Schedule(() => {
                     if (Directory.Exists(e.FullPath))
                         LoadDir(e.FullPath);
                     else if (e.FullPath.EndsWith(".zip"))
                         LoadZip(e.FullPath);
-                    ((patch_OuiMainMenu) (AssetReloadHelper.ReturnToScene as Overworld)?.GetUI<OuiMainMenu>())?.RebuildMainAndTitle();
+                    ((patch_OuiMainMenu) (AssetReloadHelper.ReturnToScene as Overworld)?.GetUI<OuiMainMenu>())?.NeedsRebuild();
                 })));
             }
 
@@ -216,16 +249,18 @@ namespace Celeste.Mod {
             /// <param name="archive">The path to the mod .zip archive.</param>
             public static void LoadZip(string archive) {
                 if (!Flags.SupportRuntimeMods) {
-                    Logger.Log(LogLevel.Warn, "loader", "Loader disabled!");
+                    Logger.Warn("loader", "Loader disabled!");
                     return;
                 }
 
                 if (!File.Exists(archive)) // Relative path? Let's just make it absolute.
                     archive = Path.Combine(PathMods, archive);
-                if (!File.Exists(archive)) // It just doesn't exist.
+                if (!File.Exists(archive)) { // It just doesn't exist.
+                    EverestSplashHandler.IncreaseLoadedModCount(null); // Increase the splash count anyway, since it was detected as an entry
                     return;
+                }
 
-                Logger.Log(LogLevel.Verbose, "loader", $"Loading mod .zip: {archive}");
+                Logger.Verbose("loader", $"Loading mod .zip: {archive}");
 
                 EverestModuleMetadata[] multimetas = null;
 
@@ -233,14 +268,14 @@ namespace Celeste.Mod {
 
                 bool metaParsed = false;
 
-                using (ZipFile zip = new ZipFile(archive)) {
-                    foreach (ZipEntry entry in zip.Entries) {
-                        if (entry.FileName is "everest.yaml" or "everest.yml") {
+                using (ZipArchive zip = ZipFile.OpenRead(archive)) {
+                    foreach (ZipArchiveEntry entry in zip.Entries) {
+                        if (entry.FullName is "everest.yaml" or "everest.yml") {
                             if (metaParsed) {
-                                Logger.Log(LogLevel.Warn, "loader", $"{archive} has both everest.yaml and everest.yml. Ignoring {entry.FileName}.");
+                                Logger.Warn("loader", $"{archive} has both everest.yaml and everest.yml. Ignoring {entry.FullName}.");
                                 continue;
                             }
-                            using (MemoryStream stream = entry.ExtractStream())
+                            using (Stream stream = entry.Open())
                             using (StreamReader reader = new StreamReader(stream)) {
                                 try {
                                     if (!reader.EndOfStream) {
@@ -251,16 +286,17 @@ namespace Celeste.Mod {
                                         }
                                     }
                                 } catch (Exception e) {
-                                    Logger.Log(LogLevel.Warn, "loader", $"Failed parsing {entry.FileName} in {archive}: {e}");
+                                    Logger.Warn("loader", $"Failed parsing {entry.FullName} in {archive}: {e}");
                                     FilesWithMetadataLoadFailures.Add(archive);
                                 }
                             }
                             metaParsed = true;
                             continue;
                         }
-                        if (entry.FileName == ".everestignore") {
+                        
+                        if (entry.FullName == ".everestignore") {
                             List<string> lines = new List<string>();
-                            using (MemoryStream stream = entry.ExtractStream())
+                            using (Stream stream = entry.Open())
                             using (StreamReader reader = new StreamReader(stream)) {
                                 while (!reader.EndOfStream) {
                                     lines.Add(reader.ReadLine());
@@ -290,6 +326,11 @@ namespace Celeste.Mod {
                 };
 
                 if (multimetas != null) {
+                    // When estimating the total mod count for the splash it is assumed that there will be exactly one
+                    // ModuleMetadata per filesystem entry, which is a valid assumption most of the time, but very few
+                    // mods do have multiple ModuleMetadatas in its everest.yaml, that's why we increase the total count
+                    // late here when we realize that one may contain multiple
+                    EverestSplashHandler.IncreaseTotalModCount(multimetas.Length-1);
                     foreach (EverestModuleMetadata multimeta in multimetas) {
                         multimeta.Multimeta = multimetas;
                         if (contentMetaParent == null)
@@ -314,16 +355,18 @@ namespace Celeste.Mod {
             /// <param name="dir">The path to the mod directory.</param>
             public static void LoadDir(string dir) {
                 if (!Flags.SupportRuntimeMods) {
-                    Logger.Log(LogLevel.Warn, "loader", "Loader disabled!");
+                    Logger.Warn("loader", "Loader disabled!");
                     return;
                 }
 
                 if (!Directory.Exists(dir)) // Relative path?
                     dir = Path.Combine(PathMods, dir);
-                if (!Directory.Exists(dir)) // It just doesn't exist.
+                if (!Directory.Exists(dir)) { // It just doesn't exist.
+                    EverestSplashHandler.IncreaseLoadedModCount(null); // Increase the splash count anyway, since it was detected as an entry
                     return;
+                }
 
-                Logger.Log(LogLevel.Verbose, "loader", $"Loading mod directory: {dir}");
+                Logger.Verbose("loader", $"Loading mod directory: {dir}");
 
                 EverestModuleMetadata[] multimetas = null;
 
@@ -331,7 +374,7 @@ namespace Celeste.Mod {
                 if (!File.Exists(metaPath)) {
                     metaPath = Path.Combine(dir, "everest.yml");
                 } else if (File.Exists(Path.Combine(dir, "everest.yml"))) {
-                    Logger.Log(LogLevel.Warn, "loader", $"{dir} has both everest.yaml and everest.yml. Ignoring everest.yml.");
+                    Logger.Warn("loader", $"{dir} has both everest.yaml and everest.yml. Ignoring everest.yml.");
                 }
                 if (File.Exists(metaPath))
                     using (StreamReader reader = new StreamReader(metaPath)) {
@@ -344,7 +387,7 @@ namespace Celeste.Mod {
                                 }
                             }
                         } catch (Exception e) {
-                            Logger.Log(LogLevel.Warn, "loader", $"Failed parsing everest.yaml in {dir}: {e}");
+                            Logger.Warn("loader", $"Failed parsing everest.yaml in {dir}: {e}");
                             FilesWithMetadataLoadFailures.Add(dir);
                         }
                     }
@@ -370,6 +413,11 @@ namespace Celeste.Mod {
                 };
 
                 if (multimetas != null) {
+                    // When estimating the total mod count for the splash it is assumed that there will be exactly one
+                    // ModuleMetadata per filesystem entry, which is a valid assumption most of the time, but very few
+                    // mods do have multiple ModuleMetadatas in its everest.yaml, that's why we increase the total count
+                    // late here when we realize that one may contain multiple
+                    EverestSplashHandler.IncreaseTotalModCount(multimetas.Length-1);
                     foreach (EverestModuleMetadata multimeta in multimetas) {
                         multimeta.Multimeta = multimetas;
                         if (contentMetaParent == null)
@@ -396,7 +444,7 @@ namespace Celeste.Mod {
             /// <param name="callback">Callback to be executed after the mod has been loaded. Executed immediately if meta == null.</param>
             public static void LoadModDelayed(EverestModuleMetadata meta, Action callback) {
                 if (!Flags.SupportRuntimeMods) {
-                    Logger.Log(LogLevel.Warn, "loader", "Loader disabled!");
+                    Logger.Warn("loader", "Loader disabled!");
                     return;
                 }
 
@@ -406,13 +454,13 @@ namespace Celeste.Mod {
                 }
 
                 if (Modules.Any(module => module.Metadata.Name == meta.Name)) {
-                    Logger.Log(LogLevel.Warn, "loader", $"Mod {meta.Name} already loaded!");
+                    Logger.Warn("loader", $"Mod {meta.Name} already loaded!");
                     return;
                 }
 
                 foreach (EverestModuleMetadata dep in meta.Dependencies)
                     if (!DependencyLoaded(dep)) {
-                        Logger.Log(LogLevel.Info, "loader", $"Dependency {dep} of mod {meta} not loaded! Delaying.");
+                        Logger.Info("loader", $"Dependency {dep} of mod {meta} not loaded! Delaying.");
                         lock (Delayed) {
                             Delayed.Add(Tuple.Create(meta, callback));
                         }
@@ -421,7 +469,7 @@ namespace Celeste.Mod {
 
                 foreach (EverestModuleMetadata dep in meta.OptionalDependencies) {
                     if (!DependencyLoaded(dep) && (enforceOptionalDependencies || Everest.Modules.Any(module => module.Metadata?.Name == dep.Name))) {
-                        Logger.Log(LogLevel.Info, "loader", $"Optional dependency {dep} of mod {meta} not loaded! Delaying.");
+                        Logger.Info("loader", $"Optional dependency {dep} of mod {meta} not loaded! Delaying.");
                         lock (Delayed) {
                             Delayed.Add(Tuple.Create(meta, callback));
                         }
@@ -431,6 +479,7 @@ namespace Celeste.Mod {
 
                 callback?.Invoke();
 
+                EverestSplashHandler.IncreaseLoadedModCount(meta.Name);
                 LoadMod(meta);
             }
 
@@ -438,58 +487,39 @@ namespace Celeste.Mod {
             /// Load a mod .dll given its metadata at runtime. Doesn't load the mod content.
             /// </summary>
             /// <param name="meta">Metadata of the mod to load.</param>
-            public static void LoadMod(EverestModuleMetadata meta) {
+            /// <returns>Whether the mod load was successful.</returns>
+            public static bool LoadMod(EverestModuleMetadata meta) {
                 if (!Flags.SupportRuntimeMods) {
-                    Logger.Log(LogLevel.Warn, "loader", "Loader disabled!");
-                    return;
+                    Logger.Warn("loader", "Loader disabled!");
+                    return false;
                 }
 
                 if (meta == null)
-                    return;
+                    return true;
 
                 using var _ = new ScopeFinalizer(() => Events.Everest.LoadMod(meta));
 
-                // Load the actual assembly.
-                Assembly asm = null;
-                if (!string.IsNullOrEmpty(meta.PathArchive)) {
-                    bool returnEarly = false;
-                    using (ZipFile zip = new ZipFile(meta.PathArchive)) {
-                        foreach (ZipEntry entry in zip.Entries) {
-                            string entryName = entry.FileName.Replace('\\', '/');
-                            if (entryName == meta.DLL) {
-                                using (MemoryStream stream = entry.ExtractStream())
-                                    asm = Relinker.GetRelinkedAssembly(meta, Path.GetFileNameWithoutExtension(meta.DLL), stream);
-                            }
+                // Create an assembly context
+                meta.AssemblyContext ??= new EverestModuleAssemblyContext(meta);
 
-                            if (entryName == "main.lua") {
-                                new LuaModule(meta).Register();
-                                returnEarly = true;
-                            }
-                        }
+                // Try to load a module from a DLL
+                if (!string.IsNullOrEmpty(meta.DLL)) {
+                    if (meta.AssemblyContext.LoadAssemblyFromModPath(meta.DLL) is not Assembly asm) {
+                        // Don't register a module - this will cause dependencies to not load
+                        Logger.Error("loader", $"Could not load DLL {meta.DLL} for mod {meta.Name}");
+                        ModsWithAssemblyLoadFailures.Add(meta);
+                        return false;
                     }
 
-                    if (returnEarly)
-                        return;
-
-                } else {
-                    if (!string.IsNullOrEmpty(meta.DLL) && File.Exists(meta.DLL)) {
-                        using (FileStream stream = File.OpenRead(meta.DLL))
-                            asm = Relinker.GetRelinkedAssembly(meta, Path.GetFileNameWithoutExtension(meta.DLL), stream);
-                    }
-
-                    if (File.Exists(Path.Combine(meta.PathDirectory, "main.lua"))) {
-                        new LuaModule(meta).Register();
-                        return;
-                    }
+                    LoadModAssembly(meta, asm);
+                    goto success;
                 }
 
-                if (asm == null) {
-                    // Register a null module for content mods.
-                    new NullModule(meta).Register();
-                    return;
-                }
-
-                LoadModAssembly(meta, asm);
+                // Register a null module for content mods.
+                new NullModule(meta).Register();
+                success:
+                meta.RegisterMod();
+                return true;
             }
 
             /// <summary>
@@ -499,135 +529,366 @@ namespace Celeste.Mod {
             /// <param name="asm">The mod assembly, preferably relinked.</param>
             public static void LoadModAssembly(EverestModuleMetadata meta, Assembly asm) {
                 if (!Flags.SupportRuntimeMods) {
-                    Logger.Log(LogLevel.Warn, "loader", "Loader disabled!");
+                    Logger.Warn("loader", "Loader disabled!");
                     return;
                 }
 
-                if (string.IsNullOrEmpty(meta.PathArchive) && File.Exists(meta.DLL) && meta.SupportsCodeReload && CoreModule.Settings.CodeReload) {
-                    try {
-                        FileSystemWatcher watcher = meta.DevWatcher = new FileSystemWatcher {
-                            Path = Path.GetDirectoryName(meta.DLL),
-                            NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite,
-                        };
-
-                        watcher.Changed += (s, e) => {
-                            if (e.FullPath != meta.DLL)
-                                return;
-                            ReloadModAssembly(s, e);
-                            // FIXME: Should we dispose the old .dll watcher?
-                        };
-
-                        watcher.EnableRaisingEvents = true;
-                    } catch (Exception e) {
-                        Logger.Log(LogLevel.Warn, "loader", $"Failed watching folder: {Path.GetDirectoryName(meta.DLL)}");
-                        e.LogDetailed();
-                        meta.DevWatcher?.Dispose();
-                        meta.DevWatcher = null;
-                    }
-                }
-
+                // Apply hackfixes
                 ApplyModHackfixes(meta, asm);
 
+                // Crawl assembly manifest content
                 Content.Crawl(new AssemblyModContent(asm) {
                     Mod = meta,
                     Name = meta.Name
                 });
 
+                // Find and register all EverestModule subtypes in the assembly
                 Type[] types;
                 try {
                     types = asm.GetTypesSafe();
                 } catch (Exception e) {
-                    Logger.Log(LogLevel.Warn, "loader", $"Failed reading assembly: {e}");
-                    e.LogDetailed();
+                    Logger.Warn("loader", $"Failed reading assembly: {e}");
+                    Logger.LogDetailed(e);
                     return;
                 }
 
                 bool foundModule = false;
-                for (int i = 0; i < types.Length; i++) {
-                    Type type = types[i];
-
+                foreach (Type type in types) {
                     EverestModule mod = null;
                     try {
                         if (typeof(EverestModule).IsAssignableFrom(type) && !type.IsAbstract) {
                             foundModule = true;
                             if (!typeof(NullModule).IsAssignableFrom(type)) {
-                                mod = (EverestModule) type.GetConstructor(_EmptyTypeArray).Invoke(_EmptyObjectArray);
+                                mod = (EverestModule) type.GetConstructor(Type.EmptyTypes).Invoke(null);
                             }
                         }
                     } catch (TypeLoadException e) {
                         // The type likely depends on a base class from a missing optional dependency
-                        Logger.Log(LogLevel.Warn, "loader", $"Skipping type '{type.FullName}' likely depending on optional dependency: {e}");
+                        Logger.Warn("loader", $"Skipping type '{type.FullName}' likely depending on optional dependency: {e}");
                     }
 
-                   if (mod != null) {
+                    if (mod != null) {
                         mod.Metadata = meta;
                         mod.Register();
-                   }
+                    }
                 }
 
                 // Warn if we didn't find a module, as that could indicate an oversight from the developer
                 if (!foundModule)
-                    Logger.Log(LogLevel.Warn, "loader", "Assembly doesn't contain an EverestModule!");
+                    Logger.Warn("loader", "Assembly doesn't contain an EverestModule!");
+
+                ProcessAssembly(meta, asm, types);
             }
 
-            internal static void ReloadModAssembly(object source, FileSystemEventArgs e, bool retrying = false) {
-                if (!File.Exists(e.FullPath))
+            internal static void ProcessAssembly(EverestModuleMetadata meta, Assembly asm, Type[] types) {
+                LuaLoader.Precache(asm);
+
+                bool newStrawberriesRegistered = false;
+
+                foreach (Type type in types) {
+                    // Search for all entities marked with the CustomEntityAttribute.
+                    foreach (CustomEntityAttribute attrib in type.GetCustomAttributes<CustomEntityAttribute>()) {
+                        foreach (string idFull in attrib.IDs) {
+                            string id;
+                            string genName;
+                            string[] split = idFull.Split('=');
+
+                            if (split.Length == 1) {
+                                id = split[0];
+                                genName = "Load";
+
+                            } else if (split.Length == 2) {
+                                id = split[0];
+                                genName = split[1];
+
+                            } else {
+                                Logger.Warn("core", $"Invalid number of custom entity ID elements: {idFull} ({type.FullName})");
+                                continue;
+                            }
+
+                            id = id.Trim();
+                            genName = genName.Trim();
+
+                            patch_Level.EntityLoader loader = null;
+
+                            ConstructorInfo ctor = null;
+                            MethodInfo gen;
+
+                            gen = type.GetMethod(genName, new Type[] { typeof(Level), typeof(LevelData), typeof(Vector2), typeof(EntityData) });
+                            if (gen != null && gen.IsStatic && gen.ReturnType.IsCompatible(typeof(Entity))) {
+                                loader = (level, levelData, offset, entityData) => {
+                                    var entityId = ((patch_Level)level).CreateEntityId(levelData, entityData);
+                                    var entity = (patch_Entity) gen.Invoke(null, new object[] { level, levelData, offset, entityData });
+                                    if (entity != null) {
+                                        entity.SourceData = entityData;
+                                        entity.SourceId = entityId;
+                                    }
+                                    
+                                    return entity;
+                                };
+                                goto RegisterEntityLoader;
+                            }
+
+                            ctor = type.GetConstructor(new Type[] { typeof(EntityData), typeof(Vector2), typeof(EntityID) });
+                            if (ctor != null) {
+                                loader = (level, levelData, offset, entityData) => {
+                                    var entityId = ((patch_Level)level).CreateEntityId(levelData, entityData);
+                                    var entity = (patch_Entity) ctor.Invoke(new object[] { entityData, offset, entityId });
+                                    entity.SourceData = entityData;
+                                    entity.SourceId = entityId;
+                                    
+                                    return entity;
+                                };
+                                goto RegisterEntityLoader;
+                            }
+
+                            ctor = type.GetConstructor(new Type[] { typeof(EntityData), typeof(Vector2) });
+                            if (ctor != null) {
+                                loader = (level, levelData, offset, entityData) => {
+                                    var entity = (patch_Entity)ctor.Invoke(new object[] { entityData, offset });
+                                    entity.SourceData = entityData;
+                                    entity.SourceId = ((patch_Level)level).CreateEntityId(levelData, entityData);
+                                    
+                                    return entity;
+                                };
+                                goto RegisterEntityLoader;
+                            }
+
+                            ctor = type.GetConstructor(new Type[] { typeof(Vector2) });
+                            if (ctor != null) {
+                                loader = (level, levelData, offset, entityData) => {
+                                    var entity = (patch_Entity)ctor.Invoke(new object[] { offset });
+                                    entity.SourceData = entityData;
+                                    entity.SourceId = ((patch_Level)level).CreateEntityId(levelData, entityData);
+                                    return entity;
+                                };
+                                goto RegisterEntityLoader;
+                            }
+
+                            ctor = type.GetConstructor(Type.EmptyTypes);
+                            if (ctor != null) {
+                                loader = (level, levelData, offset, entityData) => {
+                                    var entity = (patch_Entity)ctor.Invoke(null);
+                                    entity.SourceData = entityData;
+                                    entity.SourceId = ((patch_Level)level).CreateEntityId(levelData, entityData);
+                                    return entity;
+                                };
+                                goto RegisterEntityLoader;
+                            }
+
+                            RegisterEntityLoader:
+                            if (loader == null) {
+                                Logger.Warn("core", $"Found custom entity without suitable constructor / {genName}(Level, LevelData, Vector2, EntityData): {id} ({type.FullName})");
+                                continue;
+                            }
+
+                            // Immediately register the connection when we're calling the ctor,
+                            // since we know the return type upfront.
+                            if (ctor != null) {
+                                EntityRegistry.RegisterSidToTypeConnection(id, ctor.DeclaringType);
+                            }
+                            
+                            patch_Level.EntityLoaders[id] = loader;
+                        }
+                    }
+                    // Register with the StrawberryRegistry all entities marked with RegisterStrawberryAttribute.
+                    foreach (RegisterStrawberryAttribute attrib in type.GetCustomAttributes<RegisterStrawberryAttribute>()) {
+                        List<string> names = new List<string>();
+                        foreach (CustomEntityAttribute nameAttrib in type.GetCustomAttributes<CustomEntityAttribute>())
+                            foreach (string idFull in nameAttrib.IDs) {
+                                string[] split = idFull.Split('=');
+                                if (split.Length == 0) {
+                                    Logger.Warn("core", $"Invalid number of custom entity ID elements: {idFull} ({type.FullName})");
+                                    continue;
+                                }
+                                names.Add(split[0]);
+                            }
+                        if (names.Count == 0)
+                            goto NoDefinedBerryNames; // no customnames? skip out on registering berry
+
+                        foreach (string name in names) {
+                            StrawberryRegistry.Register(type, name, attrib.isTracked, attrib.blocksNormalCollection);
+                            newStrawberriesRegistered = true;
+                        }
+                    }
+                    NoDefinedBerryNames:
+                    ;
+
+                    // Search for all Entities marked with the CustomEventAttribute.
+                    foreach (CustomEventAttribute attrib in type.GetCustomAttributes<CustomEventAttribute>()) {
+                        foreach (string idFull in attrib.IDs) {
+                            string id;
+                            string genName;
+                            string[] split = idFull.Split('=');
+
+                            if (split.Length == 1) {
+                                id = split[0];
+                                genName = "Load";
+
+                            } else if (split.Length == 2) {
+                                id = split[0];
+                                genName = split[1];
+
+                            } else {
+                                Logger.Warn("core", $"Invalid number of custom cutscene ID elements: {idFull} ({type.FullName})");
+                                continue;
+                            }
+
+                            id = id.Trim();
+                            genName = genName.Trim();
+
+                            patch_EventTrigger.CutsceneLoader loader = null;
+
+                            ConstructorInfo ctor;
+                            MethodInfo gen;
+
+                            gen = type.GetMethod(genName, new Type[] { typeof(EventTrigger), typeof(Player), typeof(string) });
+                            if (gen != null && gen.IsStatic && gen.ReturnType.IsCompatible(typeof(Entity))) {
+                                loader = (trigger, player, eventID) => (Entity) gen.Invoke(null, new object[] { trigger, player, eventID });
+                                goto RegisterCutsceneLoader;
+                            }
+
+                            ctor = type.GetConstructor(new Type[] { typeof(EventTrigger), typeof(Player), typeof(string) });
+                            if (ctor != null) {
+                                loader = (trigger, player, eventID) => (Entity) ctor.Invoke(new object[] { trigger, player, eventID });
+                                goto RegisterCutsceneLoader;
+                            }
+
+                            ctor = type.GetConstructor(Type.EmptyTypes);
+                            if (ctor != null) {
+                                loader = (trigger, player, eventID) => (Entity) ctor.Invoke(null);
+                                goto RegisterCutsceneLoader;
+                            }
+
+                            RegisterCutsceneLoader:
+                            if (loader == null) {
+                                Logger.Warn("core", $"Found custom cutscene without suitable constructor / {genName}(EventTrigger, Player, string): {id} ({type.FullName})");
+                                continue;
+                            }
+                            patch_EventTrigger.CutsceneLoaders[id] = loader;
+                        }
+                    }
+
+                    // Search for all Backdrops marked with the CustomBackdropAttribute.
+                    foreach (CustomBackdropAttribute attrib in type.GetCustomAttributes<CustomBackdropAttribute>()) {
+                        foreach (string idFull in attrib.IDs) {
+                            string id;
+                            string genName;
+                            string[] split = idFull.Split('=');
+
+                            if (split.Length == 1) {
+                                id = split[0];
+                                genName = "Load";
+                            } else if (split.Length == 2) {
+                                id = split[0];
+                                genName = split[1];
+                            } else {
+                                Logger.Warn("core", $"Invalid number of custom backdrop ID elements: {idFull} ({type.FullName})");
+                                continue;
+                            }
+
+                            id = id.Trim();
+                            genName = genName.Trim();
+
+                            patch_MapData.BackdropLoader loader = null;
+
+                            ConstructorInfo ctor;
+                            MethodInfo gen;
+
+                            gen = type.GetMethod(genName, new Type[] { typeof(BinaryPacker.Element) });
+                            if (gen != null && gen.IsStatic && gen.ReturnType.IsCompatible(typeof(Backdrop))) {
+                                loader = data => (Backdrop) gen.Invoke(null, new object[] { data });
+                                goto RegisterBackdropLoader;
+                            }
+
+                            ctor = type.GetConstructor(new Type[] { typeof(BinaryPacker.Element) });
+                            if (ctor != null) {
+                                loader = data => (Backdrop) ctor.Invoke(new object[] { data });
+                                goto RegisterBackdropLoader;
+                            }
+
+                            RegisterBackdropLoader:
+                            if (loader == null) {
+                                Logger.Warn("core", $"Found custom backdrop without suitable constructor / {genName}(BinaryPacker.Element): {id} ({type.FullName})");
+                                continue;
+                            }
+                            patch_MapData.BackdropLoaders[id] = loader;
+                        }
+                    }
+
+                    // we already are in the overworld. Register new Ouis real quick!
+                    if (Engine.Instance != null && Engine.Scene is Overworld overworld && typeof(Oui).IsAssignableFrom(type) && !type.IsAbstract) {
+                        Logger.Verbose("core", $"Instantiating UI from {meta}: {type.FullName}");
+                        ((patch_Overworld) overworld).RegisterOui(type);
+                    }
+                }
+                // We should run the map data processors again if new berry types are registered, so that CoreMapDataProcessor assigns them checkpoint IDs and orders.
+                if (newStrawberriesRegistered && _Initialized) {
+                    Logger.Verbose("core", $"Assembly {asm.FullName} for module {meta} has custom strawberries: triggering map reload.");
+                    TriggerModInitMapReload();
+                }
+            }
+
+            /// <summary>
+            /// Reload a mod .dll and all mods depending on it given its metadata at runtime. Doesn't reload the mod content.
+            /// </summary>
+            /// <param name="meta">Metadata of the mod to reload.</param>
+            public static void ReloadMod(EverestModuleMetadata meta) {
+                if (!Flags.SupportRuntimeMods || meta.AssemblyContext == null)
                     return;
 
-                Logger.Log(LogLevel.Info, "loader", $"Reloading mod assembly: {e.FullPath}");
-                QueuedTaskHelper.Do("ReloadModAssembly:" + e.FullPath, () => {
-                    EverestModule module = _Modules.FirstOrDefault(m => m.Metadata.DLL == e.FullPath);
-                    if (module == null)
-                        return;
+                QueuedTaskHelper.Do($"ReloadModAssembly: {meta.Name}", () => {
+                    Logger.Info("loader", $"Reloading mod assemblies: {meta.Name}");
 
-                    AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMODASSEMBLY")} {Path.GetFileName(e.FullPath)}", () => {
-                        Assembly asm = null;
-                        using (FileStream stream = File.OpenRead(e.FullPath))
-                            asm = Relinker.GetRelinkedAssembly(module.Metadata, Path.GetFileNameWithoutExtension(e.FullPath), stream);
+                    AssetReloadHelper.Do($"{Dialog.Clean("ASSETRELOADHELPER_RELOADINGMODASSEMBLY")} {meta.Name}", () => {
+                        // Determine the order to load/unload modules in
+                        List<EverestModuleMetadata> reloadMods = new List<EverestModuleMetadata>();
+                        lock (Everest._Modules) {
+                            // Create reverse dependency graph
+                            Dictionary<string, List<EverestModule>> revDeps = new Dictionary<string, List<EverestModule>>();
+                            Everest._Modules.ForEach(mod => revDeps.TryAdd(mod.Metadata.Name, new List<EverestModule>()));
 
-                        if (asm == null) {
-                            if (!retrying) {
-                                // Retry.
-                                QueuedTaskHelper.Do("ReloadModAssembly:" + e.FullPath, () => {
-                                    ReloadModAssembly(source, e, true);
-                                });
+                            foreach (EverestModule mod in Everest._Modules)
+                                foreach (EverestModuleAssemblyContext depAsmCtx in mod.Metadata.AssemblyContext?.ActiveDependencyContexts ?? Enumerable.Empty<EverestModuleAssemblyContext>())
+                                    revDeps.GetValueOrDefault(depAsmCtx.ModuleMeta.Name)?.Add(mod);
+
+                            // Run a DFS over the reverse dependency graph to determine the reload order
+                            HashSet<string> visited = new HashSet<string>();
+                            void VisitMod(EverestModuleMetadata node) {
+                                // Check if we already visited this node
+                                if (!visited.Add(node.Name))
+                                    return;
+
+                                // Ensure mods which depend on this one are placed before this mod in the reload order
+                                revDeps[node.Name].ForEach(revDep => VisitMod(revDep.Metadata));
+                                reloadMods.Add(node);
                             }
-                            return;
+                            VisitMod(meta);
                         }
 
-                        ((FileSystemWatcher) source).Dispose();
+                        // Unload modules in the order determined before (dependents before dependencies)
+                        foreach (EverestModuleMetadata unloadMod in reloadMods) {
+                            Logger.Verbose("loader", $"-> unloading: {unloadMod.Name}");
+                            unloadMod.AssemblyContext?.Dispose();
+                            unloadMod.AssemblyContext = null;
+                            unloadMod.InvalidateHash();
+                        }
 
-                        // be sure to save this module's save data and session before reloading it, so that they are not lost.
-                        if (SaveData.Instance != null) {
-                            Logger.Log(LogLevel.Verbose, "core", $"Saving save data slot {SaveData.Instance.FileSlot} for {module.Metadata} before reloading");
-                            if (module.SaveDataAsync) {
-                                module.WriteSaveData(SaveData.Instance.FileSlot, module.SerializeSaveData(SaveData.Instance.FileSlot));
-                            } else {
-#pragma warning disable CS0618 // Synchronous save / load IO is obsolete but some mods still override / use it.
-                                if (CoreModule.Settings.SaveDataFlush ?? false)
-                                    module.ForceSaveDataFlush++;
-                                module.SaveSaveData(SaveData.Instance.FileSlot);
-#pragma warning restore CS0618
-                            }
-
-                            if (SaveData.Instance.CurrentSession?.InArea ?? false) {
-                                Logger.Log(LogLevel.Verbose, "core", $"Saving session slot {SaveData.Instance.FileSlot} for {module.Metadata} before reloading");
-                                if (module.SaveDataAsync) {
-                                    module.WriteSession(SaveData.Instance.FileSlot, module.SerializeSession(SaveData.Instance.FileSlot));
-                                } else {
-#pragma warning disable CS0618 // Synchronous save / load IO is obsolete but some mods still override / use it.
-                                    if (CoreModule.Settings.SaveDataFlush ?? false)
-                                        module.ForceSaveDataFlush++;
-                                    module.SaveSession(SaveData.Instance.FileSlot);
-#pragma warning restore CS0618
+                        // Load modules in the reverse order determined before (dependencies before dependents)
+                        // Delay initialization until all mods have been loaded
+                        using (new ModInitializationBatch()) {
+                            foreach (EverestModuleMetadata loadMod in reloadMods.Reverse<EverestModuleMetadata>()) {
+                                if (loadMod.Dependencies.Any(dep => !DependencyLoaded(dep))) {
+                                    Logger.Warn("loader", $"-> skipping reload of mod '{loadMod.Name}' as dependency failed to load");
+                                    continue;
                                 }
+
+                                Logger.Verbose("loader", $"-> reloading: {loadMod.Name}");
+                                if (!LoadMod(loadMod))
+                                    Logger.Warn("loader", $"-> failed to reload mod '{loadMod.Name}'!");
                             }
                         }
-
-                        Unregister(module);
-                        LoadModAssembly(module.Metadata, asm);
-                    });
-                    AssetReloadHelper.ReloadLevel();
+                    }, static () => AssetReloadHelper.ReloadLevel(true));
                 });
             }
 
@@ -676,6 +937,10 @@ namespace Celeste.Mod {
             public static bool TryGetDependency(EverestModuleMetadata dep, out EverestModule module) {
                 string depName = dep.Name;
                 Version depVersion = dep.Version;
+
+                // Harcode EverestCore as an alias for the core module
+                if (depName == CoreModule.NETCoreMetaName)
+                    depName = CoreModule.Instance.Metadata.Name;
 
                 lock (_Modules) {
                     foreach (EverestModule other in _Modules) {
